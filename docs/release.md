@@ -10,14 +10,22 @@
 - **次版本**（minor）：新增功能、向后兼容
 - **修订版本**（patch）：bug 修复、向后兼容
 
-**版本号有三处必须同步修改**（保持一致）：
+**版本号有六处必须同步修改**（保持一致）：
 
 1. `src-tauri/tauri.conf.json` 的 `version`
 2. `src-tauri/Cargo.toml` 的 `version`
 3. `package.json` 的 `version`
+4. `src-tauri/Cargo.lock` 中 `securenote` 的 `version`（cargo 构建时会自动同步，也可手动）
+5. `src/updater.ts` 的 `CURRENT_VERSION`
+6. `src-tauri/nsis/installer.nsi` 的 `!define VERSION` / `!define VERSIONWITHBUILD` 两行
 
-> `Cargo.lock` 中的 `securenote` 版本由 cargo 在构建时自动同步，无需手改。
 > 前端更新检测所需的当前版本号由 Rust 端 `get_app_version` 命令从 `CARGO_PKG_VERSION` 读取，**单一来源**，避免多处不一致。
+
+### 版本发布策略（重要）
+
+- **推送到 git 的版本保持干净**：只在功能稳定、需要让用户升级时才 bump 主版本号（如 `1.2.0` → `1.3.0`）并打 tag 发 Release，**避免频繁发版**。
+- **本地迭代用小版本号区分**：开发过程中可用 `1.3.x`（patch 位）区分本地构建，但不打 tag、不推 Release。
+- 攒够一批稳定功能后，再统一 bump 次版本号发正式版。
 
 ## 二、数据备份机制（保证数据不丢失）
 
@@ -102,5 +110,27 @@ git push origin --tags
 
 ## 五、当前版本
 
-- **当前版本**：`1.1.0`
-- **本次变更**：新增 OneNote 批量导入、滚动备份（最多 3 份）、GitHub Release 更新检测
+- **当前版本**：`1.3.0`
+- **本次变更**：
+  - 图片附件外置存储（大笔记支持，不压缩）
+  - 数据存储目录自定义 + 历史数据迁移
+  - 备份版本管理（全量 + 增量滚动备份、任意点回滚、备份管理页）
+  - 导出加密包后台化（进度展示 + 系统通知）
+  - 设置页布局重组、编辑器快捷键（Tab 缩进等）
+  - 关闭不再自动备份（改手动 + 闲时自动备份）
+
+## v1.3.0 起：自定义 NSIS 安装模板（注意）
+
+`src-tauri/nsis/installer.nsi` 是自定义 NSIS 模板（基于 Tauri 2.12.5 生成产物修改），用于把**默认安装目录从中文「个人笔记本」改为英文 `securenote`**（产品显示名/开始菜单仍是中文）。
+
+**每次升版本必须同步改模板里的 2 行**：
+```
+!define VERSION "x.y.z"
+!define VERSIONWITHBUILD "x.y.z.0"
+```
+忘记改的话安装包里显示的版本号会停留在旧值（不影响应用内版本号）。
+
+**注意事项**：
+- 模板内含构建路径（MAINBINARYSRCPATH、!include），项目目录迁移后需重新从 `target/release/nsis/x64/installer.nsi` 复制生成并重做 5 处 INSTDIR 修改。
+- 升级 Tauri 版本后建议重新对齐模板（tauri upgrade 后先用默认模板构建一次，取新产物复制再改）。
+- 5 处安装目录修改点：`MULTIUSER_INSTALLMODE_INSTDIR "securenote"` + 4 处 `StrCpy $INSTDIR "$PROGRAMFILES...\securenote"` / `"$LOCALAPPDATA\securenote"`。

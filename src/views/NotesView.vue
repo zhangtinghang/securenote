@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, nextTick, watch, inject } from "vue";
-import { notes, pickDocFile, pickDocFiles, saveTextFile, saveDataFile } from "../api";
+import { notes, attachments, pickDocFile, pickDocFiles, saveTextFile, saveDataFile } from "../api";
 import type { Note } from "../types";
 import {
   markdownToHtml,
@@ -268,15 +268,80 @@ function addNotebook() {
   selectNotebook(name);
 }
 
+/** 删除笔记本（右键菜单触发）：其下笔记自动移入「默认」，不丢数据 */
+async function deleteNotebook(nb: string) {
+  if (nb === "默认") return;
+  const count = countIn(nb);
+  const ok = await appConfirm(
+    `删除笔记本「${nb}」？\n其中 ${count} 篇笔记将自动移入「默认」笔记本，不会丢失。`,
+    "删除"
+  );
+  if (!ok) return;
+  const affected = noteList.value.filter((n) => (n.notebook || "默认") === nb);
+  for (const n of affected) {
+    const updated = await notes.update(n.id, n.title, n.content, "默认");
+    const idx = noteList.value.findIndex((x) => x.id === n.id);
+    if (idx >= 0) noteList.value[idx] = updated;
+  }
+  extraNbs.value = extraNbs.value.filter((x) => x !== nb);
+  localStorage.setItem(NB_KEY, JSON.stringify(extraNbs.value));
+  // 清理排序记录与独立加密锁
+  nbOrderIds.value = nbOrderIds.value.filter((x) => x !== nb);
+  localStorage.setItem(NB_ORDER_KEY, JSON.stringify(nbOrderIds.value));
+  if (nbLocks.value[nb]) {
+    const locks = { ...nbLocks.value };
+    delete locks[nb];
+    nbLocks.value = locks;
+    localStorage.setItem("sn_nb_locks", JSON.stringify(locks));
+  }
+  if (activeNotebook.value === nb) selectNotebook("");
+}
+
+/* ---------- 全局模糊搜索（标题 + 内容，跨所有未锁定笔记本） ---------- */
+
+const searchQuery = ref("");
+
+/** HTML 转纯文本（搜索用）：剥标签 + 解常见实体 */
+function htmlToSearchText(html: string): string {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"');
+}
+
+/** 预计算的搜索索引（noteList / 锁状态变化时重算），避免每次输入重复剥离大 HTML */
+const searchIndex = computed(() =>
+  noteList.value.map((n) => ({
+    note: n,
+    text: ((n.title || "") + " " + htmlToSearchText(n.content || "")).toLowerCase(),
+  }))
+);
+
 const favCount = computed(() => noteList.value.filter((n) => n.favorite).length);
 
 /** 第二层列表栏标题（随筛选变化） */
 const currentNbLabel = computed(() =>
-  favoriteOnly.value ? "⭐ 收藏" : activeNotebook.value || "全部笔记"
+  searchQuery.value.trim()
+    ? `🔍 搜索「${searchQuery.value.trim()}」`
+    : favoriteOnly.value
+      ? "⭐ 收藏"
+      : activeNotebook.value || "全部笔记"
 );
 
-/** 左栏列表的过滤结果（全部 / 收藏 / 某笔记本；锁定的笔记本内容不展示） */
+/** 左栏列表的过滤结果（全局搜索 / 收藏 / 某笔记本；锁定的笔记本内容不展示） */
 const filteredNotes = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase();
+  if (q) {
+    // 全局模糊搜索：标题 + 内容（不区分大小写），跨所有未锁定的笔记本
+    return searchIndex.value
+      .filter((it) => !isNbLocked(it.note.notebook || "默认") && it.text.includes(q))
+      .map((it) => it.note);
+  }
   if (favoriteOnly.value)
     return noteList.value.filter((n) => n.favorite && !isNbLocked(n.notebook || "默认"));
   if (activeNotebook.value) {
@@ -372,14 +437,34 @@ function safeName(note: Note): string {
 }
 
 /** 导出 Word（.doc，Office HTML 格式，Word/WPS 直接打开） */
+/** 把内容中的 snatt:// 附件引用还原为 dataURL（导出 md/doc 用，保证导出文件自带图片） */
+async function inlineSnattImages(text: string): Promise<string> {
+  const ids = [
+    ...new Set(Array.from(text.matchAll(/snatt:\/\/([\w-]+)/g)).map((m) => m[1])),
+  ];
+  let out = text;
+  for (const id of ids) {
+    try {
+      const att = await attachments.get(id);
+      out = out
+        .split(`snatt://${id}`)
+        .join(`data:${att.mime || "image/png"};base64,${att.data}`);
+    } catch {
+      /* 附件缺失时保留引用占位 */
+    }
+  }
+  return out;
+}
+
 async function exportDoc(note: Note) {
   try {
+    const bodyHtml = await inlineSnattImages(noteToHtml(note));
     const html = `<html xmlns:w="urn:schemas-microsoft-com:office:word">
 <head><meta charset="utf-8"><title>${note.title || "无标题"}</title>
 <style>body{font-family:"Microsoft YaHei",sans-serif;font-size:12pt;line-height:1.7}
 table{border-collapse:collapse}th,td{border:1px solid #999;padding:6px 10px}th{background:#f0f0f0}
 blockquote{border-left:3px solid #888;padding-left:10px;color:#555;margin:8px 0}</style></head>
-<body>${noteToHtml(note)}</body></html>`;
+<body>${bodyHtml}</body></html>`;
     await saveTextFile(`${safeName(note)}.doc`, html);
     ctxMenu.value = null;
   } catch (e: any) {
@@ -432,7 +517,8 @@ async function exportXlsx(note: Note) {
 
 async function exportMd(note: Note) {
   try {
-    await saveTextFile(`${safeName(note)}.md`, noteToMd(note));
+    const md = await inlineSnattImages(noteToMd(note));
+    await saveTextFile(`${safeName(note)}.md`, md);
     ctxMenu.value = null;
   } catch (e: any) {
     const msg = String(e?.message || e);
@@ -543,14 +629,14 @@ function redoEdit() {
 
 /** 编辑器内 Ctrl+Z / Ctrl+Y（Ctrl+Shift+Z）拦截；以及选中图片的删除键处理 */
 function onEditorKeydown(e: KeyboardEvent) {
-  // 选区仅为图片时，可打印字符不替换图片（防误删；方向键等不受影响）
+  // 选区仅为图片时，可打印字符与 Tab 不替换图片（防误删；方向键等不受影响）
   const sel = window.getSelection();
   if (
     sel &&
     sel.rangeCount > 0 &&
     !sel.getRangeAt(0).collapsed &&
     selectionOnlyImages(sel.getRangeAt(0)) &&
-    e.key.length === 1 &&
+    (e.key.length === 1 || e.key === "Tab") &&
     !e.ctrlKey &&
     !e.metaKey &&
     !e.altKey
@@ -565,6 +651,12 @@ function onEditorKeydown(e: KeyboardEvent) {
       return;
     }
   }
+  // Tab / Shift+Tab：插入 4 空格 / 删除光标前最多 4 个空格（写文档对齐用）
+  if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    handleEditorTab(e.shiftKey);
+    return;
+  }
   if (!e.ctrlKey || e.altKey) return;
   const k = e.key.toLowerCase();
   if (k === "z" && !e.shiftKey) {
@@ -578,6 +670,62 @@ function onEditorKeydown(e: KeyboardEvent) {
     if (tryDeleteSelectedImages("before")) {
       e.preventDefault();
       return;
+    }
+  } else if (mode.value === "rich") {
+    // 常用写作快捷键：B 粗体 / I 斜体 / U 下划线 / 1·2·3 标题 / 0 正文
+    if (k === "b") {
+      e.preventDefault();
+      exec("bold");
+    } else if (k === "i") {
+      e.preventDefault();
+      exec("italic");
+    } else if (k === "u") {
+      e.preventDefault();
+      exec("underline");
+    } else if (e.key === "1") {
+      e.preventDefault();
+      insertHeading("h1");
+    } else if (e.key === "2") {
+      e.preventDefault();
+      insertHeading("h2");
+    } else if (e.key === "3") {
+      e.preventDefault();
+      insertHeading("h3");
+    } else if (e.key === "0") {
+      e.preventDefault();
+      insertHeading("p");
+    }
+  }
+}
+
+/** Tab → 4 空格；Shift+Tab → 删除光标前最多 4 个空格（走 execCommand，保留撤销栈） */
+function handleEditorTab(shift: boolean) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return;
+  const range = sel.getRangeAt(0);
+  if (!shift) {
+    document.execCommand("insertText", false, "    ");
+    pushHistory();
+    scheduleSave();
+    return;
+  }
+  // Shift+Tab：仅光标折叠时删除前面紧邻的空格
+  if (!range.collapsed) return;
+  const node = range.startContainer;
+  const offset = range.startOffset;
+  if (node.nodeType === Node.TEXT_NODE && offset > 0) {
+    const text = node.textContent || "";
+    let n = 0;
+    while (n < 4 && offset - 1 - n >= 0 && text[offset - 1 - n] === " ") n++;
+    if (n > 0) {
+      const r = document.createRange();
+      r.setStart(node, offset - n);
+      r.setEnd(node, offset);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      document.execCommand("insertText", false, "");
+      pushHistory();
+      scheduleSave();
     }
   }
 }
@@ -612,8 +760,51 @@ function selectNote(note: Note) {
   loadContent(note.content);
 }
 
+/* ---------- 附件图片（snatt:// 外置存储）的显示与保存回写 ---------- */
+
+/** blob URL → 附件 id 映射（编辑器显示用；保存时还原回 snatt:// 引用，避免巨大数据写进内容） */
+const blobAttMap = new Map<string, string>();
+
+function revokeAllBlobUrls() {
+  for (const url of blobAttMap.keys()) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      /* ignore */
+    }
+  }
+  blobAttMap.clear();
+}
+
+/** 把编辑器内 snatt:// 引用的图片逐张解密加载为 blob URL（原图质量，不压缩） */
+async function hydrateSnattImages() {
+  const root = editorEl.value;
+  if (!root) return;
+  const imgs = Array.from(
+    root.querySelectorAll<HTMLImageElement>('img[src^="snatt://"]')
+  );
+  for (const img of imgs) {
+    const src = img.getAttribute("src") || "";
+    const id = src.slice("snatt://".length);
+    if (!id) continue;
+    try {
+      const att = await attachments.get(id);
+      const bytes = base64ToBytes(att.data);
+      const url = URL.createObjectURL(
+        new Blob([bytes.buffer as ArrayBuffer], { type: att.mime || "image/png" })
+      );
+      blobAttMap.set(url, id);
+      // 仅当该 img 仍引用同一附件时替换（期间编辑器可能已切换内容）
+      if (img.isConnected && img.getAttribute("src") === src) img.src = url;
+    } catch (err) {
+      console.warn("附件加载失败:", id, err);
+    }
+  }
+}
+
 /** 按内容格式加载进编辑器（HTML 直接进富文本；纯文本视为 Markdown 转换后进富文本） */
 function loadContent(content: string) {
+  revokeAllBlobUrls();
   if (!content) {
     mode.value = "rich";
     mdText.value = "";
@@ -630,6 +821,7 @@ function loadContent(content: string) {
     nextTick(() => {
       if (editorEl.value) editorEl.value.innerHTML = clean;
       resetHistory();
+      hydrateSnattImages();
     });
   } else {
     // 兼容旧的纯 Markdown 笔记
@@ -675,7 +867,15 @@ function collectContent(): string {
   if (mode.value === "markdown") {
     return mdText.value; // MD 模式直接存源码，加载时自动转换
   }
-  return editorEl.value ? editorEl.value.innerHTML : "";
+  if (!editorEl.value) return "";
+  // 把 blob: URL 还原为 snatt:// 附件引用，避免把巨大图片数据写进笔记内容
+  return editorEl.value.innerHTML.replace(
+    /src="(blob:[^"]*)"/g,
+    (m: string, url: string) => {
+      const id = blobAttMap.get(url);
+      return id ? `src="snatt://${id}"` : m;
+    }
+  );
 }
 
 function scheduleSave() {
@@ -732,14 +932,27 @@ async function createNote() {
   selectNote(n);
 }
 
-/** 把文档字节转成 HTML（docx 走 mammoth；md/html/txt 等走对应转换） */
-async function docBytesToHtml(ext: string, bytes: Uint8Array): Promise<string> {
+/** 把文档字节转成 HTML（docx 走 mammoth，图片转附件外置存储；md/html/txt 等走对应转换） */
+async function docBytesToHtml(ext: string, bytes: Uint8Array, noteId?: string): Promise<string> {
   if (ext === "docx") {
     const mod = await import("mammoth/mammoth.browser");
     const mammoth = (mod as any).default || mod;
-    const result = await mammoth.convertToHtml({
-      arrayBuffer: bytes.slice().buffer,
-    });
+    // 图片不压缩、不内联：上传为加密附件，HTML 中以 snatt://<id> 引用
+    // （保证原图质量，且笔记内容本身只有几百 KB，超大文档也能正常保存/渲染）
+    // 注意：mammoth.browser 的 API 是驼峰命名（imgElement / readAsBase64String），与 Node 版不同
+    const result = await mammoth.convertToHtml(
+      { arrayBuffer: bytes.slice().buffer },
+      {
+        convertImage: mammoth.images.imgElement((image: any) =>
+          image
+            .readAsBase64String()
+            .then((b64: string) =>
+              attachments.save(b64, image.contentType || "image/png", noteId)
+            )
+            .then((id: string) => ({ src: "snatt://" + id }))
+        ),
+      }
+    );
     const html = result?.value || "";
     if (!html.trim() && result?.messages?.length) {
       console.warn("mammoth 提示:", result.messages);
@@ -756,58 +969,6 @@ async function docBytesToHtml(ext: string, bytes: Uint8Array): Promise<string> {
   return plainTextToHtml(decodeText(bytes));
 }
 
-/**
- * 按 OneNote 分区导出 docx 的页面结构拆分 HTML。
- * mammoth 会把每个 OneNote 页面标题转成 <h1>（分区名是文档主标题，可能是 h1 或文档级标题）。
- * 策略：以 <h1> 为分页符，每段拆成独立笔记（标题 = h1 文本，正文 = 其后内容）。
- * 若只有一处 h1（或没有），则整体作为单条笔记返回。
- */
-function splitDocxPages(html: string): Array<{ title: string; content: string }> {
-  // 用 DOMParser 解析，按 h1 切分（保持块级结构稳定）
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  const body = doc.body;
-  const pages: Array<{ title: string; content: string }> = [];
-  let currentTitle = "";
-  const currentNodes: Node[] = [];
-  let seenH1 = false;
-
-  const flush = () => {
-    const container = document.createElement("div");
-    currentNodes.forEach((n) => container.appendChild(n.cloneNode(true)));
-    const content = container.innerHTML.trim();
-    if (content || currentTitle) {
-      pages.push({ title: currentTitle.trim(), content });
-    }
-    currentNodes.length = 0;
-  };
-
-  for (const node of Array.from(body.childNodes)) {
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      const el = node as Element;
-      if (el.tagName.toLowerCase() === "h1") {
-        if (!seenH1) {
-          // 第一个 h1 视为文档/分区主标题，丢弃（分区名已作为笔记本分类）
-          seenH1 = true;
-          continue;
-        }
-        // 后续 h1 是页面标题：先保存上一段，再开启新页
-        flush();
-        currentTitle = el.textContent?.trim() || "";
-        seenH1 = true;
-        continue;
-      }
-    }
-    currentNodes.push(node.cloneNode(true));
-  }
-  flush();
-
-  // 未拆分出任何页面（没有 h1 或只有一个主标题）：整体作为单条
-  if (pages.length === 0) {
-    return [{ title: "", content: html }];
-  }
-  return pages.filter((p) => p.title || p.content.trim());
-}
-
 /** 导入文档为新笔记：docx 走 mammoth 转 HTML；md 走 Markdown 转换；txt/log/csv 按纯文本段落；html 直接导入 */
 async function importWord() {
   try {
@@ -820,22 +981,44 @@ async function importWord() {
         "这不是有效的 .docx 文件（可能是老版 .doc 或损坏文件）。请在 Word/WPS 中另存为 .docx 后重试"
       );
     }
-    let html = await docBytesToHtml(ext, bytes);
-    // 导入内容同样剥离背景/颜色类内联样式，避免 Word 文档带白底在暗黑皮肤下难看
-    html = stripColorStyles(html);
-    if (!html.trim()) {
-      alert(
-        `未能从文档中提取到内容（文件大小 ${(bytes.length / 1024).toFixed(1)} KB）。` +
-          `若为老版 .doc 格式，请先在 Word/WPS 中另存为 .docx 再导入`
+    if (bytes.length > MAX_IMPORT_BYTES) {
+      throw new Error(
+        `文件超过 200MB（${(bytes.length / 1024 / 1024).toFixed(0)} MB），无法导入。` +
+          `建议在 Word 中拆分文档后再试`
       );
-      return;
     }
+    // 先创建笔记占位（图片附件挂到该笔记名下，便于回收站清理），转换后写入内容
     const targetNb = activeNotebook.value || "默认";
     const n = await notes.create(name, targetNb);
-    const saved = await notes.update(n.id, name, html, targetNb);
-    noteList.value.unshift(saved);
-    syncNoteView();
-    selectNote(saved);
+    try {
+      let html = await docBytesToHtml(ext, bytes, n.id);
+      // 导入内容同样剥离背景/颜色类内联样式，避免 Word 文档带白底在暗黑皮肤下难看
+      html = stripColorStyles(html);
+      if (!html.trim()) {
+        await notes.remove(n.id);
+        alert(
+          `未能从文档中提取到内容（文件大小 ${(bytes.length / 1024).toFixed(1)} KB）。` +
+            `若为老版 .doc 格式，请先在 Word/WPS 中另存为 .docx 再导入`
+        );
+        return;
+      }
+      if (html.length > MAX_IMPORT_HTML) {
+        await notes.remove(n.id);
+        alert(
+          `文档转换后文字内容过大（${(html.length / 1024 / 1024).toFixed(1)} MB），` +
+            `无法可靠导入。建议在 Word 中拆分文档后再试`
+        );
+        return;
+      }
+      const saved = await notes.update(n.id, name, html, targetNb);
+      noteList.value.unshift(saved);
+      syncNoteView();
+      selectNote(saved);
+    } catch (err) {
+      // 转换失败：清理占位笔记（进回收站）
+      await notes.remove(n.id).catch(() => {});
+      throw err;
+    }
   } catch (e: any) {
     const msg = String(e?.message || e);
     if (msg && msg !== "已取消导入") alert("导入失败: " + msg);
@@ -844,10 +1027,16 @@ async function importWord() {
   }
 }
 
+/** 导入文件大小上限（防呆；图片转附件外置后，超大文档主要消耗转换时间而非内存） */
+const MAX_IMPORT_BYTES = 200 * 1024 * 1024;
+/** 转换后 HTML 上限：图片已外置为附件，超限说明是超大体量的纯文字文档，渲染会不可靠 */
+const MAX_IMPORT_HTML = 64 * 1024 * 1024;
+
 /**
- * 批量导入（用于 OneNote 迁移等场景）：
- * 多选文档，每个 docx 按 OneNote 页面（h1）拆成多条笔记，
- * 以文件名作为笔记本分类，页面标题作为笔记标题，逐条导入。
+ * 批量导入（通用功能）：
+ * 多选文档，每个文件整体作为一条笔记——标题 = 文件名（去扩展名），内容 = 全文。
+ * 导入到当前选中的笔记本分类（未选中则进「默认」）。
+ * 支持 docx（走 mammoth 转 HTML，大图自动压缩）、md/txt/html 等。
  */
 async function importDocs() {
   try {
@@ -855,6 +1044,8 @@ async function importDocs() {
     importing.value = true;
     let created = 0;
     let skipped = 0;
+    const tooBig: string[] = [];
+    const nb = activeNotebook.value || "默认";
 
     for (const [name, ext, dataB64] of files) {
       const bytes = base64ToBytes(dataB64);
@@ -862,38 +1053,45 @@ async function importDocs() {
         skipped++;
         continue;
       }
-      const rawHtml = await docBytesToHtml(ext, bytes);
-      const html = stripColorStyles(rawHtml);
-      if (!html.trim()) {
-        skipped++;
+      if (bytes.length > MAX_IMPORT_BYTES) {
+        tooBig.push(name);
         continue;
       }
-
-      // 笔记本分类名 = 文件名（即 OneNote 分区名）
-      const nb = name || "导入";
-      if (!extraNbs.value.includes(nb) && nb !== "默认") {
-        extraNbs.value = [...extraNbs.value, nb];
-        localStorage.setItem(NB_KEY, JSON.stringify(extraNbs.value));
-      }
-
-      // docx 按页拆分；其他格式（md/txt/html）整文件作为一条
-      const pages =
-        ext === "docx"
-          ? splitDocxPages(html)
-          : [{ title: name, content: html }];
-
-      for (const page of pages) {
-        const noteTitle = (page.title || name).trim() || "未命名";
-        const n = await notes.create(noteTitle, nb);
-        await notes.update(n.id, noteTitle, page.content, nb);
-        noteList.value.unshift(n);
+      // 整个文件作为一条笔记：标题 = 文件名（去扩展名），内容 = 全文。
+      // 先创建笔记（占位），转换时图片附件挂到该笔记名下（便于回收站清理），再写入内容
+      const noteTitle = name.replace(/\.[^.]+$/, "").trim() || "未命名";
+      const n = await notes.create(noteTitle, nb);
+      try {
+        const rawHtml = await docBytesToHtml(ext, bytes, n.id);
+        const html = stripColorStyles(rawHtml);
+        if (!html.trim()) {
+          skipped++;
+          await notes.remove(n.id);
+          continue;
+        }
+        if (html.length > MAX_IMPORT_HTML) {
+          tooBig.push(name);
+          await notes.remove(n.id);
+          continue;
+        }
+        // 必须用 update 的返回值（create 返回的 content 为空），否则列表里笔记内容是空白
+        const saved = await notes.update(n.id, noteTitle, html, nb);
+        noteList.value.unshift(saved);
         created++;
+      } catch (err) {
+        // 转换失败：清理占位笔记（进回收站），继续下一个文件
+        await notes.remove(n.id).catch(() => {});
+        throw err;
       }
     }
 
     syncNoteView();
-    if (created > 0) {
-      alert(`批量导入完成：共导入 ${created} 条笔记${skipped ? `，跳过 ${skipped} 个文件` : ""}。`);
+    if (created > 0 || tooBig.length) {
+      let msg = created > 0 ? `批量导入完成：共导入 ${created} 条笔记` : "没有导入任何笔记";
+      if (skipped) msg += `，跳过 ${skipped} 个无法识别/空内容的文件`;
+      if (tooBig.length)
+        msg += `。以下文件超过 64MB（转换后）已跳过，建议在 Word 中拆分后导入:\n${tooBig.join("\n")}`;
+      alert(msg);
     } else {
       alert("没有成功导入任何笔记，请检查所选文件。");
     }
@@ -903,19 +1101,6 @@ async function importDocs() {
   } finally {
     importing.value = false;
   }
-}
-
-async function deleteNote() {
-  if (!activeId.value) return;
-  const ok = await appConfirm(
-    `删除笔记「${editTitle.value || "无标题"}」？\n删除后进入回收站，保留 15 天`,
-    "删除"
-  );
-  if (!ok) return;
-  await notes.remove(activeId.value);
-  noteList.value = noteList.value.filter((n) => n.id !== activeId.value);
-  activeId.value = null;
-  if (noteList.value.length) selectNote(noteList.value[0]);
 }
 
 function toggleFavorite(note: Note) {
@@ -932,7 +1117,7 @@ function syncNoteView() {
   noteView.value = filteredNotes.value;
 }
 
-watch([noteList, favoriteOnly, activeNotebook], () => {
+watch([noteList, favoriteOnly, activeNotebook, searchQuery], () => {
   if (noteDragState) return; // 拖拽进行中不覆盖渲染数组
   syncNoteView();
 }, { deep: true });
@@ -1083,6 +1268,52 @@ function onEditorInput() {
   scheduleSave();
 }
 
+/** MD 模式：Tab → 4 空格，Shift+Tab → 删除光标前最多 4 个空格（不把焦点切走） */
+function onMdKeydown(e: KeyboardEvent) {
+  if (e.key !== "Tab" || e.ctrlKey || e.metaKey || e.altKey) return;
+  e.preventDefault();
+  const ta = e.target as HTMLTextAreaElement;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const val = ta.value;
+  if (e.shiftKey) {
+    // 删除光标/选区前紧邻的最多 4 个空格
+    let n = 0;
+    while (n < 4 && start - 1 - n >= 0 && val[start - 1 - n] === " ") n++;
+    if (n === 0) return;
+    const next = val.slice(0, start - n) + val.slice(start);
+    mdText.value = next;
+    setMdSelection(start - n, end - n);
+  } else {
+    // 选区覆盖整行多行时按行缩进，否则插入 4 空格
+    const multiline = end > start && val.slice(start, end).includes("\n");
+    if (multiline) {
+      const lineStart = val.lastIndexOf("\n", start - 1) + 1;
+      const block = val.slice(lineStart, end);
+      const indented = block
+        .split("\n")
+        .map((l) => (l.trim() ? "    " + l : l))
+        .join("\n");
+      mdText.value = val.slice(0, lineStart) + indented + val.slice(end);
+      setMdSelection(lineStart, lineStart + indented.length);
+    } else {
+      mdText.value = val.slice(0, start) + "    " + val.slice(end);
+      setMdSelection(start + 4, start + 4);
+    }
+  }
+  scheduleSave();
+}
+
+/** 修改 mdText 后恢复 textarea 光标/选区（nextTick 等 v-model 同步完成） */
+function setMdSelection(start: number, end: number) {
+  nextTick(() => {
+    const ta = document.querySelector(".md-editor") as HTMLTextAreaElement | null;
+    if (!ta) return;
+    ta.selectionStart = start;
+    ta.selectionEnd = end;
+  });
+}
+
 function insertHeading(level: string) {
   // Chromium 的 formatBlock 要求带尖括号：<h1> / <blockquote>
   exec("formatBlock", `<${level}>`);
@@ -1124,30 +1355,26 @@ function insertImageFile() {
   input.click();
 }
 
-function insertImageBlob(file: Blob, filename?: string) {
-  if (file.size > 5 * 1024 * 1024) {
-    alert("图片超过 5MB，请压缩后再插入");
+async function insertImageBlob(file: Blob, filename?: string) {
+  // 图片上传为加密附件（原图保存，不压缩），内容中以 snatt://<id> 引用
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const mime = file.type || "image/png";
+  const src =
+    "snatt://" + (await attachments.save(bytesToBase64(buf), mime, activeId.value || undefined));
+  if (mode.value === "markdown") {
+    mdText.value += `\n![${filename || "图片"}](${src})\n`;
+    scheduleSave();
     return;
   }
-  const reader = new FileReader();
-  reader.onload = () => {
-    const dataUrl = reader.result as string;
-    if (mode.value === "markdown") {
-      mdText.value += `\n![${filename || "图片"}](${dataUrl})\n`;
-      scheduleSave();
-      return;
-    }
-    editorEl.value?.focus();
-    document.execCommand(
-      "insertHTML",
-      false,
-      `<img src="${dataUrl}" alt="${filename || "图片"}" style="max-width:100%;">` +
-        // 图片独立成行后补一个空段落：光标落在段落里，避免在图片右侧出现超高光标
-        "<p><br></p>"
-    );
-    scheduleSave();
-  };
-  reader.readAsDataURL(file);
+  editorEl.value?.focus();
+  document.execCommand(
+    "insertHTML",
+    false,
+    `<img src="${src}" alt="${filename || "图片"}" style="max-width:100%;">` +
+      // 图片独立成行后补一个空段落：光标落在段落里，避免在图片右侧出现超高光标
+      "<p><br></p>"
+  );
+  scheduleSave();
 }
 
 /* ---------- 表格 / 图片 上下文编辑 ---------- */
@@ -1574,7 +1801,10 @@ function onPaste(e: ClipboardEvent) {
     if (item.type.startsWith("image/")) {
       e.preventDefault();
       const blob = item.getAsFile();
-      if (blob) insertImageBlob(blob, "粘贴图片");
+      if (blob)
+        insertImageBlob(blob, "粘贴图片").catch((err) =>
+          alert("图片插入失败: " + (err?.message || err))
+        );
       return;
     }
   }
@@ -1611,6 +1841,7 @@ function switchMode(target: "rich" | "markdown") {
     nextTick(() => {
       if (editorEl.value) editorEl.value.innerHTML = html;
       resetHistory();
+      hydrateSnattImages();
     });
   }
   mode.value = target;
@@ -1675,6 +1906,15 @@ onMounted(() => {
       >{{ isNbLocked(nb) ? "🔒" : "📗" }}</button>
     </aside>
     <aside v-else class="nb-panel" :style="{ width: nbWidth + 'px' }">
+      <div class="nb-search">
+        <input
+          v-model="searchQuery"
+          type="text"
+          placeholder="🔍 全局搜索（标题 / 内容）"
+          title="跨所有笔记本模糊搜索标题与正文，清空即恢复"
+        />
+        <button v-if="searchQuery" class="clear" title="清空搜索" @click="searchQuery = ''">×</button>
+      </div>
       <div
         class="nb-item"
         :class="{ active: !activeNotebook && !favoriteOnly }"
@@ -1738,6 +1978,9 @@ onMounted(() => {
       <div v-if="nbLocks[nbCtx.nb]" class="item danger" @click="openNbDialog('remove', nbCtx.nb); nbCtx = null">
         🔓 移除密码
       </div>
+      <div v-if="nbCtx.nb !== '默认'" class="item danger" @click="deleteNotebook(nbCtx.nb); nbCtx = null">
+        🗑 删除笔记本
+      </div>
     </div>
 
     <!-- 第二层：笔记列表 -->
@@ -1751,7 +1994,7 @@ onMounted(() => {
           <button class="btn xs" :disabled="importing" title="把 Word / TXT / Log / MD / CSV / HTML 文档导入为新笔记" @click="importWord">
             {{ importing ? "导入中…" : "📥 导入" }}
           </button>
-          <button class="btn xs" :disabled="importing" title="批量导入多个文档（如 OneNote 分区的 docx，按页拆分为多条笔记）" @click="importDocs">
+          <button class="btn xs" :disabled="importing" title="批量导入多个文档，每个文件导入为一条笔记（支持 docx / md / txt / html，导入到当前选中的分类）" @click="importDocs">
             {{ importing ? "导入中…" : "📚 批量" }}
           </button>
           <button class="btn xs primary" @click="createNote">＋ 新建</button>
@@ -1778,11 +2021,16 @@ onMounted(() => {
               >{{ note.favorite ? "★" : "☆" }}</span
             >
           </div>
-          <div class="meta">{{ new Date(note.updated_at).toLocaleString() }}</div>
+          <div class="meta">
+            <span v-if="searchQuery.trim()" class="nb-tag" :title="note.notebook || '默认'">📗 {{ note.notebook || "默认" }}</span>
+            {{ new Date(note.updated_at).toLocaleString() }}
+          </div>
         </div>
         <div v-if="!noteView.length" class="empty">
           {{
-            activeNotebook && isNbLocked(activeNotebook)
+            searchQuery.trim()
+              ? "没有匹配的笔记"
+              : activeNotebook && isNbLocked(activeNotebook)
               ? "🔒 该笔记本已加密，点击左侧笔记本输入密码查看"
               : favoriteOnly
                 ? "暂无收藏笔记"
@@ -1905,22 +2153,6 @@ onMounted(() => {
           <span class="paste-tip">💡 支持粘贴截图和表格</span>
           <button
             class="btn sm"
-            :disabled="importing"
-            title="导入 Word / TXT / Log / MD / CSV / HTML 文档为新笔记"
-            @click="importWord"
-          >
-            {{ importing ? "导入中…" : "📥 导入" }}
-          </button>
-          <button
-            class="btn sm"
-            :disabled="importing"
-            title="批量导入多个文档（如 OneNote 分区导出的 docx，按页拆分为多条笔记）"
-            @click="importDocs"
-          >
-            {{ importing ? "导入中…" : "📚 批量导入" }}
-          </button>
-          <button
-            class="btn sm"
             :class="{ primary: mode === 'markdown' }"
             title="切换到 Markdown 源码"
             @click="switchMode('markdown')"
@@ -1935,8 +2167,6 @@ onMounted(() => {
           >
             富文本
           </button>
-          <button class="btn sm primary" @click="saveNote">保存</button>
-          <button class="btn sm danger" @click="deleteNote">删除</button>
         </div>
 
         <!-- 编辑区滚动容器：子工具栏 sticky 钉在顶部（固定位置、紧凑、不跟随鼠标） -->
@@ -1985,6 +2215,7 @@ onMounted(() => {
           class="md-editor"
           placeholder="使用 Markdown 语法书写，例如：&#10;# 标题&#10;**加粗** *斜体*&#10;- 列表项&#10;| 表格 | 头 |&#10;| --- | --- |"
           @input="scheduleSave"
+          @keydown="onMdKeydown"
         ></textarea>
 
         <div class="status-bar">{{ saving ? "保存中..." : "自动保存已开启" }}</div>
@@ -2162,6 +2393,48 @@ onMounted(() => {
   font-size: 11px;
   color: var(--muted);
   padding: 10px 10px 4px;
+}
+/* 全局搜索框（笔记本栏顶部） */
+.nb-search {
+  position: relative;
+  padding: 8px 10px 4px;
+}
+.nb-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 26px 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+}
+.nb-search input:focus {
+  border-color: var(--accent);
+}
+.nb-search .clear {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(calc(-50% - 2px));
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+/* 搜索结果中的笔记本归属标签 */
+.nb-tag {
+  display: inline-block;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+  margin-right: 6px;
 }
 .new-list {
   margin-top: auto;
@@ -2425,15 +2698,16 @@ onMounted(() => {
   -webkit-user-drag: none;
   user-select: auto;
 }
-/* 图片选中态：去掉浏览器默认的半透明蓝色遮罩，改用清爽的描边高亮 */
+/* 图片选中态：彻底去掉浏览器默认的蓝色遮罩，仅用一条细描边做轻提示 */
 .rich-editor :deep(img)::selection,
 .rich-editor :deep(img)::-moz-selection {
-  background: transparent;
+  background-color: transparent;
+  color: transparent;
+  -webkit-tap-highlight-color: transparent;
 }
 .rich-editor :deep(img.selected-img) {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: 1.5px solid var(--accent);
+  outline-offset: 1px;
 }
 /* 双击放大预览层 */
 .img-preview {

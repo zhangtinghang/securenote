@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, inject, onMounted } from "vue";
-import { vault, auth, setContentProtection, getBackupDir, chooseBackupDir, resetBackupDir, getAppVersion, forceBackup, openUrl } from "../api";
+import { vault, auth, setContentProtection, getBackupDir, chooseBackupDir, resetBackupDir, getDataDir, chooseDataDir, resetDataDir, getAppVersion, forceBackup, getIdleBackup, setIdleBackup, openUrl } from "../api";
+import { exportRunning } from "../exportProgress";
 import { applyTheme, themeOptions, type ThemeName } from "../theme";
 import { checkForUpdate, type UpdateInfo } from "../updater";
 
@@ -16,6 +17,8 @@ const appVersion = ref("1.0.0");
 
 /** 当前备份目录 */
 const backupDir = ref("");
+/** 当前数据存储目录 */
+const dataDir = ref("");
 /** 是否正在检查更新 */
 const checkingUpdate = ref(false);
 
@@ -27,6 +30,13 @@ onMounted(async () => {
     /* 忽略 */
   }
   await refreshBackupDir();
+  await refreshDataDir();
+  // 读取闲时自动备份开关
+  try {
+    idleBackup.value = await getIdleBackup();
+  } catch (e) {
+    /* 忽略 */
+  }
 });
 
 async function refreshBackupDir() {
@@ -39,10 +49,14 @@ async function refreshBackupDir() {
 
 /** 选择备份目录 */
 async function pickBackupDir() {
+  if (exportRunning.value) {
+    showToast("已有后台任务进行中，请等待完成");
+    return;
+  }
   try {
     const dir = await chooseBackupDir();
     backupDir.value = dir;
-    showToast(`✓ 备份目录已更改为：${dir}`);
+    showToast(`✓ 备份目录已更改为：${dir}（历史备份正在后台迁移，可在顶部查看进度）`);
   } catch (e: any) {
     const msg = String(e?.message || e);
     if (msg.includes("取消")) return;
@@ -52,12 +66,98 @@ async function pickBackupDir() {
 
 /** 恢复默认备份目录 */
 async function resetBackupDirToDefault() {
+  if (exportRunning.value) {
+    showToast("已有后台任务进行中，请等待完成");
+    return;
+  }
   try {
     const dir = await resetBackupDir();
     backupDir.value = dir;
-    showToast(`✓ 已恢复默认备份目录：${dir}`);
+    showToast(`✓ 已恢复默认备份目录：${dir}（历史备份正在后台迁移）`);
   } catch (e: any) {
     showToast("恢复失败: " + String(e?.message || e));
+  }
+}
+
+/** 手动立即备份（滚动保留最近 3 份） */
+async function doManualBackup() {
+  try {
+    const filename = await forceBackup();
+    showToast(`✓ 全量备份完成：${filename}`);
+  } catch (e: any) {
+    showToast("备份失败: " + String(e?.message || e));
+  }
+}
+
+/** 闲时自动备份开关 */
+const idleBackup = ref(false);
+
+async function toggleIdleBackup() {
+  const next = !idleBackup.value;
+  try {
+    await setIdleBackup(next);
+    idleBackup.value = next;
+    showToast(
+      next
+        ? "✓ 已开启：空闲 3 分钟且数据有变化时自动后台备份"
+        : "已关闭闲时自动备份"
+    );
+  } catch (e: any) {
+    showToast("设置失败: " + String(e?.message || e));
+  }
+}
+
+/** 读取当前数据存储目录 */
+async function refreshDataDir() {
+  try {
+    dataDir.value = await getDataDir();
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+/** 更改数据存储目录：后台迁移历史数据，完成后自动重启应用 */
+async function pickDataDir() {
+  if (exportRunning.value) {
+    showToast("已有后台任务进行中，请等待完成");
+    return;
+  }
+  const ok = await appConfirm(
+    "迁移分两步自动完成（期间会弹出进度遮罩，请勿关闭应用）：\n\n" +
+      "· 第 1 步：快照备份当前数据到备份目录\n" +
+      "· 第 2 步：把数据复制到新目录（原目录保留作兜底）\n\n" +
+      "完成后应用自动重启，需要重新输入主密码解锁。\n是否选择新目录？",
+    "选择目录并迁移"
+  );
+  if (!ok) return;
+  try {
+    await chooseDataDir();
+    showToast("✓ 迁移任务已开始，可在顶部工具栏查看进度，完成后自动重启");
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("取消")) return;
+    showToast("迁移失败: " + msg);
+  }
+}
+
+/** 恢复默认数据存储目录：后台迁移回默认目录，完成后自动重启 */
+async function resetDataDirToDefault() {
+  if (exportRunning.value) {
+    showToast("已有后台任务进行中，请等待完成");
+    return;
+  }
+  const ok = await appConfirm(
+    "将把数据迁移回默认目录（弹出进度遮罩，请勿关闭应用），\n完成后应用自动重启（需重新输入主密码）。是否继续？",
+    "迁移并重启"
+  );
+  if (!ok) return;
+  try {
+    await resetDataDir();
+    showToast("✓ 迁移任务已开始，可在顶部工具栏查看进度，完成后自动重启");
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("取消")) return;
+    showToast("迁移失败: " + msg);
   }
 }
 
@@ -123,10 +223,23 @@ function showToast(msg: string) {
 }
 
 // 一键导出（Rust 端弹保存框并写文件）
+/** 后台导出加密包：弹保存框 → 后台线程执行，进度见顶部工具栏，完成系统通知 */
 async function doExport() {
+  if (exportRunning.value) {
+    showToast("已有导出任务进行中，请在顶部工具栏查看进度");
+    return;
+  }
+  const ok = await appConfirm(
+    "当前数据量较大，导出将在后台执行，期间可正常使用其他功能。\n\n" +
+      "· 先弹出保存位置选择框\n" +
+      "· 顶部工具栏显示导出进度\n" +
+      "· 完成后系统通知\n\n是否开始导出？",
+    "开始导出"
+  );
+  if (!ok) return;
   try {
-    const path = await vault.exportToFile();
-    showToast(`✓ 导出成功：${path}（文件已加密，可上传云盘）`);
+    const path = await vault.startExportToFile();
+    showToast(`✓ 导出任务已开始（${path}），可在顶部查看进度，完成后会通知你`);
   } catch (e: any) {
     const msg = String(e?.message || e);
     if (msg.includes("取消")) return;
@@ -178,7 +291,7 @@ async function changePwd() {
       <h2>设置</h2>
 
       <section class="block">
-        <h3>外观主题</h3>
+        <h3>外观</h3>
         <div class="theme-grid">
           <button
             v-for="opt in themeOptions"
@@ -198,25 +311,53 @@ async function changePwd() {
       </section>
 
       <section class="block">
-        <h3>备份与还原</h3>
+        <h3>数据与备份</h3>
         <div class="row-card">
           <div class="desc">
-            <div class="t">自动备份位置</div>
-            <div class="s">关闭/升级时自动备份到此目录，滚动保留最近 3 份</div>
+            <div class="t">数据存储位置</div>
+            <div class="s">笔记 / 待办 / 密码 / 图片附件等全部加密数据所在目录</div>
+            <div class="s path" :title="dataDir">{{ dataDir || "加载中…" }}</div>
+          </div>
+          <div class="btn-group">
+            <button class="btn" :disabled="exportRunning" @click="pickDataDir">📁 更改目录</button>
+            <button class="btn" :disabled="exportRunning" @click="resetDataDirToDefault">恢复默认</button>
+          </div>
+        </div>
+        <div class="s" style="margin-bottom:10px">
+          更改目录时数据在后台迁移（顶部工具栏显示进度，不阻塞操作），原目录数据保留作为兜底；
+          迁移完成后应用自动重启；默认备份目录也会跟随数据存储目录。
+        </div>
+        <div class="row-card">
+          <div class="desc">
+            <div class="t">备份位置</div>
+            <div class="s">手动备份 / 升级前备份 / 闲时自动备份保存到此目录，滚动保留最近 3 份；更改目录时历史备份文件会自动复制过去</div>
             <div class="s path" :title="backupDir">{{ backupDir || "加载中…" }}</div>
           </div>
           <div class="btn-group">
-            <button class="btn" @click="pickBackupDir">📁 更改目录</button>
-            <button class="btn" @click="resetBackupDirToDefault">恢复默认</button>
+            <button class="btn" :disabled="exportRunning" @click="doManualBackup">💾 立即备份</button>
+            <button class="btn" :disabled="exportRunning" @click="pickBackupDir">📁 更改目录</button>
+            <button class="btn" :disabled="exportRunning" @click="resetBackupDirToDefault">恢复默认</button>
           </div>
         </div>
         <div class="row-card">
           <div class="desc">
-            <div class="t">一键导出全部数据</div>
-            <div class="s">格式：加密 JSON（AES-256-GCM）· 含笔记 / 待办 / 密码库</div>
-            <div class="s">导出文件不可直接读取，可上传云盘完成备份</div>
+            <div class="t">闲时自动后台备份</div>
+            <div class="s">开启后：空闲 3 分钟且数据有变化时，自动在后台备份一次（每分钟检查一次）</div>
+            <div class="s">关闭软件时不再自动备份（避免大数据量时等待），靠此开关与手动备份保障数据安全</div>
           </div>
-          <button class="btn primary" @click="doExport">📦 导出加密包</button>
+          <button class="switch" :class="{ on: idleBackup }" @click="toggleIdleBackup">
+            <span class="knob"></span>
+          </button>
+        </div>
+        <div class="row-card">
+          <div class="desc">
+            <div class="t">一键导出全部数据</div>
+            <div class="s">格式：加密 JSON（AES-256-GCM）· 含笔记 / 待办 / 密码库 / 图片附件</div>
+            <div class="s">后台执行不卡界面：顶部工具栏显示进度，完成后系统通知；文件不可直接读取，可上传云盘完成备份</div>
+          </div>
+          <button class="btn primary" @click="doExport" :disabled="exportRunning">
+            {{ exportRunning ? "⏳ 导出中…" : "📦 导出加密包" }}
+          </button>
         </div>
         <div class="row-card">
           <div class="desc">
@@ -228,7 +369,7 @@ async function changePwd() {
       </section>
 
       <section class="block">
-        <h3>隐私保护</h3>
+        <h3>安全与隐私</h3>
         <div class="row-card">
           <div class="desc">
             <div class="t">投屏 / 录屏时隐藏窗口内容（推荐开启）</div>
@@ -239,11 +380,7 @@ async function changePwd() {
             <span class="knob"></span>
           </button>
         </div>
-      </section>
-
-      <section class="block">
-        <h3>安全</h3>
-        <div class="field">
+        <div class="field" style="margin-top:10px">
           <label>当前主密码</label>
           <input v-model="oldPwd" type="password" />
         </div>
@@ -291,16 +428,13 @@ async function changePwd() {
   background: var(--panel);
 }
 .content {
-  /* 两列布局：每个分区占一列，列宽随窗口大小自适应伸缩 */
-  max-width: none;
+  /* 单列全宽布局：每个设置区块独占一行铺满，避免左右区块高度悬殊不对称 */
   padding: 24px;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 18px;
-  align-items: start;
 }
 h2 {
-  grid-column: 1 / -1;
   margin-bottom: 0;
 }
 .block {
@@ -309,9 +443,6 @@ h2 {
   border-radius: 12px;
   padding: 16px;
   margin-bottom: 0;
-}
-.block.about {
-  grid-column: 1 / -1;
 }
 .about-line {
   display: flex;
@@ -346,6 +477,7 @@ h2 {
 .theme-card {
   flex: 1;
   min-width: 160px;
+  max-width: 300px;
   border: 1px solid var(--border);
   background: var(--card);
   border-radius: 12px;

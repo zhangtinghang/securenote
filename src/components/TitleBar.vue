@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, onMounted, onBeforeUnmount } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useRouter } from "vue-router";
 import { quitApp } from "../api";
+import { exportRunning, exportPercent, exportMessage, exportKind, exportFlash } from "../exportProgress";
+
+/** 顶栏任务文案：按任务类型区分 */
+const taskLabel = computed(() => {
+  if (exportKind.value === "migrate-data") return "数据迁移中";
+  if (exportKind.value === "migrate-backup") return "备份迁移中";
+  return "导出中";
+});
 
 const appWindow = getCurrentWindow();
-const router = useRouter();
 const maximized = ref(false);
 
 async function refreshMaximized() {
@@ -23,17 +29,8 @@ function toggleMaximize() {
   appWindow.toggleMaximize().catch(() => {});
 }
 function closeWin() {
-  // 走 Rust 端退出命令：触发退出前自动备份询问，再真正退出（而非仅隐藏到托盘）
+  // 走 Rust 端退出命令：立即隐藏窗口并退出（关闭不再自动备份，备份由手动/闲时自动完成）
   quitApp().catch(() => appWindow.close().catch(() => {}));
-}
-
-function openAbout() {
-  // 跳转到设置页的"关于"区块
-  router.push("/settings");
-}
-function openHelp() {
-  // 跳转到设置页（含使用说明与关于信息）
-  router.push("/settings");
 }
 
 let unlisten: (() => void) | null = null;
@@ -70,9 +67,16 @@ onBeforeUnmount(() => {
       <span class="tb-title">个人笔记本</span>
     </div>
 
+    <!-- 后台任务进度胶囊（全局可见：导出 / 数据迁移 / 备份迁移） -->
+    <div v-if="exportRunning" class="tb-export" :title="exportMessage">
+      <span class="tb-export-spinner"></span>
+      <span class="tb-export-text">{{ taskLabel }} {{ exportPercent }}% · {{ exportMessage }}</span>
+    </div>
+    <div v-else-if="exportFlash" class="tb-export" :class="{ done: exportFlash.startsWith('✓') }">
+      <span class="tb-export-text">{{ exportFlash }}</span>
+    </div>
+
     <div class="tb-right">
-      <button class="tb-btn" title="关于我们" @click="openAbout">关于</button>
-      <button class="tb-btn" title="帮助文档" @click="openHelp">帮助</button>
       <span class="tb-sep"></span>
       <button class="tb-btn tb-ctrl" title="最小化" @click="minimize">
         <svg viewBox="0 0 12 12" width="12" height="12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" stroke-width="1.2" /></svg>
@@ -114,6 +118,44 @@ onBeforeUnmount(() => {
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
+}
+/* 后台导出进度胶囊 */
+.tb-export {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(79, 110, 247, 0.12));
+  color: var(--accent, #4f6ef7);
+  font-size: 12px;
+  -webkit-app-region: no-drag;
+  max-width: 46%;
+  overflow: hidden;
+  user-select: none;
+}
+.tb-export.done {
+  background: rgba(63, 185, 80, 0.14);
+  color: #2da44e;
+}
+.tb-export-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tb-export-spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: tb-spin 0.8s linear infinite;
+}
+@keyframes tb-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .tb-right {
   display: flex;

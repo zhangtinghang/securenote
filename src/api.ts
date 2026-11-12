@@ -56,10 +56,22 @@ export const passwords = {
     invoke<string>("generate_password", { length, useUpper, useLower, useDigits, useSymbols }),
 };
 
+// 笔记附件（图片等大文件外置存储，HTML 中以 snatt://<id> 引用）
+export const attachments = {
+  /** 保存附件（base64 原始字节），返回附件 id */
+  save: (dataB64: string, mime: string, noteId?: string) =>
+    invoke<string>("save_attachment", { dataB64, mime, noteId: noteId ?? null }),
+  /** 读取附件（解密），返回 { id, mime, data }，data 为原始字节 base64 */
+  get: (id: string) =>
+    invoke<{ id: string; mime: string; data: string }>("get_attachment", { id }),
+};
+
 // 导入导出与同步
 export const vault = {
-  /** 一键导出：弹出保存框并写入加密文件，返回保存路径 */
+  /** 一键导出：弹出保存框并写入加密文件，返回保存路径（同步，小数据量） */
   exportToFile: () => invoke<string>("export_vault_to_file"),
+  /** 后台导出：弹出保存框后在后台线程执行，进度走 export-progress 事件，完成发系统通知 */
+  startExportToFile: () => invoke<string>("start_export_to_file"),
   /** 一键导入：弹出选择框读取加密文件并还原，返回 [处理条数, 文件路径] */
   importFromFile: (mode: string) =>
     invoke<[number, string]>("import_vault_from_file", { mode }),
@@ -90,6 +102,41 @@ export const quitApp = () => invoke<void>("quit_app");
 /** 强制备份（静默，升级前/设置页触发），返回备份文件路径 */
 export const forceBackup = () => invoke<string>("force_backup");
 
+/** 节流上报用户活动（供闲时自动备份判断空闲） */
+export const touchActivity = () => invoke<void>("touch_activity");
+
+/** 获取闲时自动备份开关 */
+export const getIdleBackup = () => invoke<boolean>("get_idle_backup");
+
+/** 设置闲时自动备份开关 */
+export const setIdleBackup = (enabled: boolean) =>
+  invoke<void>("set_idle_backup", { enabled });
+
+/** 重启应用（数据目录迁移完成后自动调用，加载新目录） */
+export const restartApp = () => invoke<void>("restart_app");
+
+/** 备份点类型与元信息（与 Rust BackupPoint 对应） */
+export interface BackupPointInfo {
+  id: string;
+  kind: "full" | "incremental";
+  created_at: string;
+  size: number;
+  filename: string;
+  parent_id: string | null;
+  change_count: number;
+}
+
+/** 列出所有备份点（按时间升序） */
+export const listBackupPoints = () => invoke<BackupPointInfo[]>("list_backup_points");
+
+/** 删除指定备份点（全量会级联删除其后的增量） */
+export const deleteBackupPoint = (id: string) =>
+  invoke<void>("delete_backup_point", { id });
+
+/** 回滚到指定备份点（后台执行，进度走 export-progress 事件） */
+export const rollbackToBackup = (id: string) =>
+  invoke<string>("rollback_to_backup", { id });
+
 /** 获取当前应用版本号 */
 export const getAppVersion = () => invoke<string>("get_app_version");
 
@@ -101,6 +148,21 @@ export const chooseBackupDir = () => invoke<string>("choose_backup_dir");
 
 /** 恢复默认备份目录 */
 export const resetBackupDir = () => invoke<string>("reset_backup_dir");
+
+/** 获取当前数据存储目录（vault 所在目录） */
+export const getDataDir = () => invoke<string>("get_data_dir");
+
+/** 弹出目录选择框，选择新数据存储目录并迁移数据（成功后应用自动重启） */
+export const chooseDataDir = () => invoke<string>("choose_data_dir");
+
+/** 恢复默认数据目录并迁移数据（成功后应用自动重启） */
+export const resetDataDir = () => invoke<string>("reset_data_dir");
+
+/** 一键导出（同步，小数据量用；会阻塞 UI 直到完成） */
+export const exportVaultToFile = () => invoke<string>("export_vault_to_file");
+
+/** 后台导出：弹出保存框后在后台线程执行，进度走 export-progress 事件，完成后系统通知 */
+export const startExportToFile = () => invoke<string>("start_export_to_file");
 
 /** 选择要导入的文档（docx/txt/log/md/csv/html），返回 [文件名, 扩展名, base64 内容] */
 export const pickDocFile = () =>

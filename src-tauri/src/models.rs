@@ -117,6 +117,10 @@ pub struct VaultData {
     pub todos: Vec<Todo>,
     pub passwords: Vec<PasswordEntry>,
     pub meta: serde_json::Value,
+    /// 笔记附件（图片等，base64 原始字节；payload 整体仍由 DEK 加密）。
+    /// HTML 内容中以 `snatt://<id>` 引用，实现大图外置存储（v1.3.1 起）。
+    #[serde(default)]
+    pub attachments: Vec<AttachmentItem>,
     /// 密钥材料（用于「从备份初始化」跨设备还原）：
     /// - salt：主密码派生 KEK 用的盐（base64）
     /// - enc_dek：用 KEK 加密后的数据加密密钥 DEK（base64）
@@ -128,4 +132,66 @@ pub struct VaultData {
     pub enc_dek: Option<String>,
     #[serde(default)]
     pub key_check: Option<String>,
+}
+
+/// 单个附件（备份 payload 用）：data 为原始字节的 base64（明文，整体 payload 加密）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentItem {
+    pub id: String,
+    #[serde(default)]
+    pub note_id: Option<String>,
+    #[serde(default)]
+    pub mime: String,
+    pub data: String,
+}
+
+/// 备份点类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupKind {
+    /// 全量备份（完整快照，可独立还原）
+    Full,
+    /// 增量备份（基于前一个备份点的差异）
+    Incremental,
+}
+
+/// 备份点元信息（manifest.json 中的一条记录）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupPoint {
+    /// 备份点唯一 id（文件名去扩展名）
+    pub id: String,
+    /// 全量 or 增量
+    pub kind: BackupKind,
+    /// 创建时间（RFC3339）
+    pub created_at: String,
+    /// 文件大小（字节）
+    pub size: u64,
+    /// 文件名（含扩展名）
+    pub filename: String,
+    /// 该增量基于的备份点 id（全量为 None）
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// 本次备份包含的变更条目数（增量有意义，全量为总条目数）
+    #[serde(default)]
+    pub change_count: usize,
+}
+
+/// 备份清单（backup 目录下 manifest.json）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BackupManifest {
+    /// 按时间升序排列的备份点
+    pub points: Vec<BackupPoint>,
+    /// 全量备份保留上限（默认 3）
+    #[serde(default = "default_max_full")]
+    pub max_full: usize,
+    /// 增量备份数量达到此阈值后建议全量备份（默认 20）
+    #[serde(default = "default_inc_threshold")]
+    pub inc_threshold: usize,
+}
+
+fn default_max_full() -> usize {
+    3
+}
+fn default_inc_threshold() -> usize {
+    20
 }

@@ -32,6 +32,8 @@ pub enum VaultError {
     Serialize(String),
     #[error("文件操作失败: {0}")]
     Io(String),
+    #[error("附件不存在: {0}")]
+    AttachmentNotFound(String),
 }
 
 /// 主密钥（KEK），仅存于内存
@@ -179,6 +181,18 @@ impl Vault {
                 [],
             )?;
         }
+        // 清理已被永久删除的笔记的附件（回收站内的保留，支持恢复）
+        let expired_note_ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM notes WHERE deleted_at IS NOT NULL
+                 AND julianday(deleted_at) < julianday('now', '-15 days')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for id in &expired_note_ids {
+            total += conn.execute("DELETE FROM attachments WHERE note_id = ?1", params![id])?;
+        }
         Ok(total)
     }
 
@@ -236,16 +250,28 @@ impl Vault {
     /// 明文头仅含 salt/enc_dek/key_check（都是加密后的密钥材料，不含明文数据），
     /// 安全性仍由主密码保证；这样备份文件可跨设备「从备份初始化」还原。
     pub fn export(&self) -> Result<String, VaultError> {
+        self.export_with_progress(&|_, _| {})
+    }
+
+    /// 带进度回调的导出：percent 0-100，message 为阶段描述
+    pub fn export_with_progress(
+        &self,
+        on_progress: &dyn Fn(u32, &str),
+    ) -> Result<String, VaultError> {
         let dek = self.dek()?;
         let store = self.store();
         let salt = store.get_meta("salt")?.ok_or(VaultError::NotInitialized)?;
         let enc_dek = store.get_meta("enc_dek")?.ok_or(VaultError::NotInitialized)?;
         let key_check = store.get_meta("key_check")?.ok_or(VaultError::NotInitialized)?;
 
-        let payload = self.collect_payload()?;
+        let payload = self.collect_payload(on_progress)?;
+        on_progress(62, "序列化数据中…");
         let json_str = serde_json::to_string(&payload)
             .map_err(|e| VaultError::Serialize(e.to_string()))?;
+        on_progress(66, "加密中…");
         let enc = encrypt(json_str.as_bytes(), dek.as_ref())?;
+        drop(json_str); // 及时释放大字符串内存
+        on_progress(72, "准备写入文件…");
 
         // 明文头：密钥材料（供跨设备还原）
         let head = serde_json::json!({
@@ -258,15 +284,77 @@ impl Vault {
         Ok(format!("{}\n{}", head.to_string(), enc))
     }
 
-    /// 收集所有数据为 payload
-    fn collect_payload(&self) -> Result<SyncPayload, VaultError> {
+    /// 增量导出：只导出「自 since 时间点以来」变化的数据（按 updated_at / created_at 过滤）。
+    /// 返回 (加密备份串, 变更条目数)。格式与全量导出一致（明文头 + DEK 加密 payload），
+    /// 但 payload 仅含变更的记录，用于「全量 + 增量」叠加回滚。
+    pub fn export_incremental(
+        &self,
+        since: &str,
+        on_progress: &dyn Fn(u32, &str),
+    ) -> Result<(String, usize), VaultError> {
+        let dek = self.dek()?;
+        let store = self.store();
+        let salt = store.get_meta("salt")?.ok_or(VaultError::NotInitialized)?;
+        let enc_dek = store.get_meta("enc_dek")?.ok_or(VaultError::NotInitialized)?;
+        let key_check = store.get_meta("key_check")?.ok_or(VaultError::NotInitialized)?;
+
+        let conn = store.conn();
+        on_progress(10, "扫描变更笔记…");
+        let notes = Self::load_notes_since(&conn, dek.as_ref(), since)?;
+        on_progress(35, "扫描变更待办…");
+        let todos = Self::load_todos_since(&conn, dek.as_ref(), since)?;
+        on_progress(55, "扫描变更密码…");
+        let passwords = Self::load_passwords_since(&conn, dek.as_ref(), since)?;
+        on_progress(70, "扫描变更附件…");
+        let attachments = Self::load_attachments_since(&conn, dek.as_ref(), since)?;
+        on_progress(85, "数据扫描完成");
+        let change_count = notes.len() + todos.len() + passwords.len() + attachments.len();
+
+        let payload = SyncPayload {
+            format: "securenote-vault-incremental".to_string(),
+            version: 2,
+            exported_at: Utc::now().to_rfc3339(),
+            payload: VaultData {
+                notes,
+                todos,
+                passwords,
+                attachments,
+                meta: json!({}),
+                salt: Some(salt.clone()),
+                enc_dek: Some(enc_dek.clone()),
+                key_check: Some(key_check.clone()),
+            },
+        };
+        let json_str = serde_json::to_string(&payload)
+            .map_err(|e| VaultError::Serialize(e.to_string()))?;
+        let enc = encrypt(json_str.as_bytes(), dek.as_ref())?;
+        drop(json_str);
+
+        let head = serde_json::json!({
+            "format": "securenote-vault-incremental",
+            "version": 2,
+            "salt": salt,
+            "enc_dek": enc_dek,
+            "key_check": key_check,
+        });
+        Ok((format!("{}\n{}", head.to_string(), enc), change_count))
+    }
+
+    /// 收集所有数据为 payload（带进度回调：0-55 读取阶段）
+    fn collect_payload(&self, on_progress: &dyn Fn(u32, &str)) -> Result<SyncPayload, VaultError> {
         let dek = self.dek()?;
         let store = self.store();
         let conn = store.conn();
 
+        on_progress(4, "读取笔记中…");
         let notes = Self::load_notes(&conn, dek.as_ref())?;
+        on_progress(14, "读取待办中…");
         let todos = Self::load_todos(&conn, dek.as_ref())?;
+        on_progress(20, "读取密码库中…");
         let passwords = Self::load_passwords(&conn, dek.as_ref())?;
+        on_progress(26, "读取图片附件中…");
+        let attachments = Self::load_attachments(&conn, dek.as_ref())?;
+        on_progress(55, "数据读取完成");
 
         // 读取密钥材料，让备份文件自包含、可跨设备还原
         let salt = store.get_meta("salt")?;
@@ -281,6 +369,7 @@ impl Vault {
                 notes,
                 todos,
                 passwords,
+                attachments,
                 meta: json!({}),
                 salt,
                 enc_dek,
@@ -306,6 +395,7 @@ impl Vault {
             conn.execute("DELETE FROM notes", [])?;
             conn.execute("DELETE FROM todos", [])?;
             conn.execute("DELETE FROM passwords", [])?;
+            conn.execute("DELETE FROM attachments", [])?;
         }
 
         let mut count = 0;
@@ -317,6 +407,9 @@ impl Vault {
         }
         for pwd in &payload.payload.passwords {
             count += Self::upsert_password(&conn, dek.as_ref(), pwd, mode)?;
+        }
+        for att in &payload.payload.attachments {
+            count += Self::upsert_attachment(&conn, dek.as_ref(), att)?;
         }
         Ok(count)
     }
@@ -372,6 +465,7 @@ impl Vault {
             conn.execute("DELETE FROM notes", [])?;
             conn.execute("DELETE FROM todos", [])?;
             conn.execute("DELETE FROM passwords", [])?;
+            conn.execute("DELETE FROM attachments", [])?;
         }
 
         // 写入数据（用 DEK 加密存库）
@@ -386,6 +480,9 @@ impl Vault {
             }
             for pwd in &payload.payload.passwords {
                 count += Self::upsert_password(&conn, &dek, pwd, "replace")?;
+            }
+            for att in &payload.payload.attachments {
+                count += Self::upsert_attachment(&conn, &dek, att)?;
             }
         }
 
@@ -467,6 +564,45 @@ impl Vault {
         Ok(result)
     }
 
+    /// 加载 updated_at > since 的笔记（增量备份用）
+    fn load_notes_since(
+        conn: &rusqlite::Connection,
+        dek: &[u8],
+        since: &str,
+    ) -> Result<Vec<Note>, VaultError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, content, notebook, favorite, created_at, updated_at, deleted_at
+             FROM notes WHERE updated_at > ?1 ORDER BY updated_at",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, title, content, notebook, favorite, created_at, updated_at, deleted_at) = row?;
+            result.push(Note {
+                id,
+                title: decrypt_str(&title, dek)?.to_string(),
+                content: decrypt_str(&content, dek)?.to_string(),
+                notebook: decrypt_str(&notebook, dek)?.to_string(),
+                favorite: favorite != 0,
+                created_at,
+                updated_at,
+                deleted_at,
+            });
+        }
+        Ok(result)
+    }
+
     fn load_todos(conn: &rusqlite::Connection, dek: &[u8]) -> Result<Vec<Todo>, VaultError> {
         let mut stmt = conn.prepare(
             "SELECT id, title, note, list, priority, due_at, remind_at, repeat, completed,
@@ -474,6 +610,65 @@ impl Vault {
              FROM todos WHERE deleted_at IS NULL ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, i64>(12)?,
+                r.get::<_, String>(13)?,
+                r.get::<_, String>(14)?,
+                r.get::<_, Option<String>>(15)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (
+                id, title, note, list, priority, due_at, remind_at, repeat, completed,
+                completed_at, sort_order, pinned, favorite, created_at, updated_at, deleted_at,
+            ) = row?;
+            result.push(Todo {
+                id,
+                title: decrypt_str(&title, dek)?.to_string(),
+                note: decrypt_str(&note, dek)?.to_string(),
+                list: decrypt_str(&list, dek)?.to_string(),
+                priority,
+                due_at,
+                remind_at,
+                repeat,
+                completed: completed != 0,
+                completed_at,
+                sort_order,
+                pinned: pinned != 0,
+                favorite: favorite != 0,
+                created_at,
+                updated_at,
+                deleted_at,
+            });
+        }
+        Ok(result)
+    }
+
+    /// 加载 updated_at > since 的待办（增量备份用）
+    fn load_todos_since(
+        conn: &rusqlite::Connection,
+        dek: &[u8],
+        since: &str,
+    ) -> Result<Vec<Todo>, VaultError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, note, list, priority, due_at, remind_at, repeat, completed,
+                    completed_at, sort_order, pinned, favorite, created_at, updated_at, deleted_at
+             FROM todos WHERE updated_at > ?1 ORDER BY updated_at",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -573,6 +768,59 @@ impl Vault {
         Ok(result)
     }
 
+    /// 加载 updated_at > since 的密码（增量备份用）
+    fn load_passwords_since(
+        conn: &rusqlite::Connection,
+        dek: &[u8],
+        since: &str,
+    ) -> Result<Vec<PasswordEntry>, VaultError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, name, username, password, url, note, category, favorite, tags, created_at, updated_at, deleted_at
+             FROM passwords WHERE updated_at > ?1 ORDER BY updated_at",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, name, username, password, url, note, category, favorite, tags, created_at, updated_at, deleted_at) =
+                row?;
+            let tags_list: Vec<String> = if tags.is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(&decrypt_str(&tags, dek)?.to_string()).unwrap_or_default()
+            };
+            result.push(PasswordEntry {
+                id,
+                name: decrypt_str(&name, dek)?.to_string(),
+                username: decrypt_str(&username, dek)?.to_string(),
+                password: decrypt_str(&password, dek)?.to_string(),
+                url: decrypt_str(&url, dek)?.to_string(),
+                note: decrypt_str(&note, dek)?.to_string(),
+                category: decrypt_str(&category, dek)?.to_string(),
+                favorite: favorite != 0,
+                tags: tags_list,
+                created_at,
+                updated_at,
+                deleted_at,
+            });
+        }
+        Ok(result)
+    }
+
     fn upsert_note(
         conn: &rusqlite::Connection,
         dek: &[u8],
@@ -620,6 +868,132 @@ impl Vault {
                 ],
             )?;
         }
+        Ok(1)
+    }
+
+    // ---- 附件（图片等大文件外置存储，HTML 中以 snatt://<id> 引用）----
+
+    /// 保存附件（明文字节 → DEK 加密存库），返回附件 id
+    pub fn save_attachment(
+        &self,
+        data: &[u8],
+        mime: &str,
+        note_id: Option<&str>,
+    ) -> Result<String, VaultError> {
+        let dek = self.dek()?;
+        let store = self.store();
+        let conn = store.conn_mut();
+        let id = Uuid::new_v4().to_string();
+        let enc = encrypt(data, dek.as_ref())?;
+        conn.execute(
+            "INSERT INTO attachments(id, note_id, mime, data, created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![id, note_id, mime, enc, Utc::now().to_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
+    /// 读取附件（解密），返回 (mime, 明文字节)
+    pub fn get_attachment(&self, id: &str) -> Result<(String, Vec<u8>), VaultError> {
+        let dek = self.dek()?;
+        let store = self.store();
+        let conn = store.conn();
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT mime, data FROM attachments WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let (mime, enc) = row.ok_or_else(|| VaultError::AttachmentNotFound(id.to_string()))?;
+        let bytes = decrypt(&enc, dek.as_ref())?;
+        Ok((mime, bytes))
+    }
+
+    /// 永久删除单个笔记时清理其附件（回收站内的笔记附件保留，支持恢复）
+    pub fn delete_attachments_for_note(&self, note_id: &str) -> Result<usize, VaultError> {
+        let store = self.store();
+        let conn = store.conn_mut();
+        Ok(conn.execute("DELETE FROM attachments WHERE note_id = ?1", params![note_id])?)
+    }
+
+    /// 加载全部附件（备份用）：data 转为明文 base64（payload 整体仍由 DEK 加密）
+    fn load_attachments(
+        conn: &rusqlite::Connection,
+        dek: &[u8],
+    ) -> Result<Vec<AttachmentItem>, VaultError> {
+        let mut stmt =
+            conn.prepare("SELECT id, note_id, mime, data FROM attachments ORDER BY created_at")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, note_id, mime, enc) = row?;
+            let plain = decrypt_bytes(&enc, dek)?;
+            result.push(AttachmentItem {
+                id,
+                note_id,
+                mime,
+                data: base64_encode(&plain),
+            });
+        }
+        Ok(result)
+    }
+
+    /// 加载 created_at > since 的附件（增量备份用；附件只有 created_at 无 updated_at）
+    fn load_attachments_since(
+        conn: &rusqlite::Connection,
+        dek: &[u8],
+        since: &str,
+    ) -> Result<Vec<AttachmentItem>, VaultError> {
+        let mut stmt = conn.prepare(
+            "SELECT id, note_id, mime, data FROM attachments WHERE created_at > ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, note_id, mime, enc) = row?;
+            let plain = decrypt_bytes(&enc, dek)?;
+            result.push(AttachmentItem {
+                id,
+                note_id,
+                mime,
+                data: base64_encode(&plain),
+            });
+        }
+        Ok(result)
+    }
+
+    /// 写入附件（导入/还原用）：payload 中的明文 base64 → 当前库 DEK 加密存库
+    fn upsert_attachment(
+        conn: &rusqlite::Connection,
+        dek: &[u8],
+        item: &AttachmentItem,
+    ) -> Result<usize, VaultError> {
+        let plain = base64_decode(&item.data)
+            .map_err(|e| VaultError::Serialize(format!("附件 base64 解码失败: {e}")))?;
+        let enc = encrypt(&plain, dek)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO attachments(id, note_id, mime, data, created_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![item.id, item.note_id, item.mime, enc, Utc::now().to_rfc3339()],
+        )?;
         Ok(1)
     }
 

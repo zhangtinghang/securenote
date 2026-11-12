@@ -38,4 +38,5 @@ coverage/
 # 本地数据（切勿提交用户加密库与备份）
 *.vault
 *.snvault
+*.sninc
 backup/

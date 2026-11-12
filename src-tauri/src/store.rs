@@ -132,9 +132,18 @@ impl Store {
                 deleted_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS attachments (
+                id TEXT PRIMARY KEY,
+                note_id TEXT,
+                mime TEXT NOT NULL DEFAULT '',
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
             CREATE INDEX IF NOT EXISTS idx_todos_updated ON todos(updated_at);
             CREATE INDEX IF NOT EXISTS idx_passwords_updated ON passwords(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_attachments_note ON attachments(note_id);
             "#,
         )?;
         Ok(())

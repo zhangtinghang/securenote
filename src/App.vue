@@ -8,8 +8,9 @@ import ConfirmDialog from "./components/ConfirmDialog.vue";
 import TitleBar from "./components/TitleBar.vue";
 import { useResizable } from "./useResizable";
 import { initTheme } from "./theme";
-import { setContentProtection, getAppVersion, openUrl, forceBackup } from "./api";
+import { setContentProtection, getAppVersion, openUrl, forceBackup, touchActivity } from "./api";
 import { checkForUpdate } from "./updater";
+import { initExportProgressListener, exportBlocking, exportPercent, exportMessage } from "./exportProgress";
 
 /** 投屏保护：默认开启，共享屏幕/录屏时窗口不可见（设置页可关） */
 async function applyContentProtection() {
@@ -47,9 +48,10 @@ const mainNavItems = [
   { path: "/passwords", label: "密码库", icon: "🔑" },
   { path: "/toolbox", label: "工具箱", icon: "🧰" },
 ];
-/** 底部导航：回收站 / 设置（锁定固定在最下） */
+/** 底部导航：回收站 / 备份管理 / 设置（锁定固定在最下） */
 const footNavItems = [
   { path: "/trash", label: "回收站", icon: "🗑️" },
+  { path: "/backup", label: "备份管理", icon: "💾" },
   { path: "/settings", label: "设置", icon: "⚙️" },
 ];
 
@@ -121,15 +123,42 @@ async function setupTrayListeners() {
     await listen("tray-minimized", () => {
       console.info("SecureNote 已最小化到系统托盘");
     });
+    // 增量备份数达到阈值 → 提示建议做一次全量备份
+    await listen<number>("backup-suggest-full", (e) => {
+      const n = e.payload ?? 0;
+      confirmRef.value?.ask(
+        `当前已有 ${n} 个增量备份。\n\n增量备份过多会增加回滚耗时，建议现在做一次全量备份以压缩历史。\n\n可在「备份管理」页手动全量备份，或继续使用增量备份。`,
+        "去备份管理"
+      ).then((ok) => {
+        if (ok) router.push("/backup");
+      });
+    });
   } catch (e) {
     console.warn("托盘事件监听不可用", e);
   }
+}
+
+/** 用户活动上报（节流 5 秒）：供 Rust 端闲时自动备份判断"空闲超过 3 分钟" */
+function setupActivityReporter() {
+  let last = 0;
+  const report = () => {
+    const now = Date.now();
+    if (now - last < 5000) return;
+    last = now;
+    touchActivity().catch(() => {});
+  };
+  window.addEventListener("mousemove", report, { passive: true });
+  window.addEventListener("keydown", report, { passive: true });
+  window.addEventListener("click", report, { passive: true });
+  window.addEventListener("wheel", report, { passive: true });
 }
 
 onMounted(() => {
   initTheme();
   boot();
   setupTrayListeners();
+  initExportProgressListener();
+  setupActivityReporter();
   applyContentProtection();
   // 延迟几秒静默检查更新，避免与启动/解锁流程抢资源
   setTimeout(checkUpdates, 3000);
@@ -238,6 +267,20 @@ onMounted(() => {
     <main class="main">
       <router-view />
     </main>
+    </div>
+
+    <!-- 数据迁移遮罩：迁移期间限制操作，展示明确的两阶段进度 -->
+    <div v-if="exportBlocking" class="migrate-mask">
+      <div class="migrate-panel">
+        <div class="migrate-icon">🔐</div>
+        <div class="migrate-title">正在保护并迁移你的数据</div>
+        <div class="migrate-sub">迁移期间请勿关闭应用，数据正在安全处理中</div>
+        <div class="migrate-bar">
+          <div class="migrate-bar-fill" :style="{ width: exportPercent + '%' }"></div>
+        </div>
+        <div class="migrate-percent">{{ exportPercent }}%</div>
+        <div class="migrate-msg">{{ exportMessage }}</div>
+      </div>
     </div>
   </div>
 
@@ -405,5 +448,65 @@ onMounted(() => {
   flex: 1;
   overflow: hidden;
   display: flex;
+}
+/* 数据迁移遮罩：全屏半透明，居中进度面板 */
+.migrate-mask {
+  position: fixed;
+  inset: 40px 0 0 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+.migrate-panel {
+  background: var(--card, #fff);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px 40px;
+  width: 380px;
+  max-width: 90vw;
+  text-align: center;
+  box-shadow: 0 16px 60px rgba(0, 0, 0, 0.3);
+}
+.migrate-icon {
+  font-size: 40px;
+  margin-bottom: 12px;
+}
+.migrate-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.migrate-sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 22px;
+}
+.migrate-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--hover-strong, #e8eaf0);
+  overflow: hidden;
+}
+.migrate-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #4f6ef7, #7c5cf0);
+  transition: width 0.25s ease;
+}
+.migrate-percent {
+  margin-top: 12px;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--accent, #4f6ef7);
+}
+.migrate-msg {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text);
 }
 </style>
