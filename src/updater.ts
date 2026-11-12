@@ -5,7 +5,7 @@
  */
 
 /** GitHub 仓库地址（owner/repo 形式）。发布到 Release 前请确认此值正确。 */
-export const GITHUB_REPO = "your-org/securenote";
+export const GITHUB_REPO = "zhangtinghang/securenote";
 
 /** 当前应用版本号（与 Cargo.toml 保持一致，构建后由 Rust 端提供真实值） */
 export const CURRENT_VERSION = "1.1.1";
