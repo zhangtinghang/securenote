@@ -1,0 +1,190 @@
+:root {
+  color-scheme: light;
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --border: #e4e6ea;
+  --text: #1f2329;
+  --muted: #8a919c;
+  --accent: #4f6ef7;
+  --accent-soft: #eef1fe;
+  --red: #e5484d;
+  --green: #3aa76d;
+  --amber: #e8a23d;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.06);
+  /* 扩展变量：供换肤统一色调 */
+  --card: #ffffff;
+  --hover: #f5f6f8;
+  --hover-strong: #eef0f4;
+  --red-bg: #fdecec;
+  --green-bg: #e8f6ef;
+  --amber-bg: #fdf3e3;
+  --scrollbar: #d0d4dc;
+}
+
+/* ---------- 护眼主题（米绿） ---------- */
+[data-theme="eye"] {
+  --bg: #e7ecd9;
+  --panel: #f0f4e4;
+  --border: #d3dcc0;
+  --text: #2f3a28;
+  --muted: #79856c;
+  --accent: #5a8a4f;
+  --accent-soft: #dfe9d0;
+  --shadow: 0 1px 3px rgba(60, 80, 40, 0.08), 0 4px 16px rgba(60, 80, 40, 0.08);
+  --card: #f7f9ee;
+  --hover: #e5ebd4;
+  --hover-strong: #dbe3c6;
+  --red-bg: #f3e3d8;
+  --green-bg: #dde9cd;
+  --amber-bg: #f0e8cf;
+  --scrollbar: #c2cdae;
+}
+
+/* ---------- 暗黑主题 ---------- */
+[data-theme="dark"] {
+  color-scheme: dark; /* 输入框等 UA 控件用暗色渲染，避免文字过淡 */
+  --bg: #14161a;
+  --panel: #1d2026;
+  --border: #34383f;
+  --text: #e6e8ec;
+  --muted: #99a0ab;
+  --accent: #6c86ff;
+  --accent-soft: #2a3145;
+  --red: #f05b60;
+  --green: #4cc38a;
+  --amber: #f0b455;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.4);
+  --card: #23262d;
+  --hover: #262a31;
+  --hover-strong: #2e333b;
+  --red-bg: #3d2628;
+  --green-bg: #233a2e;
+  --amber-bg: #3c3223;
+  --scrollbar: #3d424b;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text);
+  transition: 0.15s;
+}
+
+.btn:hover {
+  background: var(--hover);
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.btn.primary:hover {
+  opacity: 0.9;
+  filter: brightness(0.95);
+}
+
+.btn.danger {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* ---------- 侧边栏折叠把手：贴边、垂直居中（50% 高度）的细长竖条 ---------- */
+.edge-handle {
+  width: 12px;
+  position: relative;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.edge-handle .handle-grip {
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  transform: translateY(-50%);
+  width: 7px;
+  height: 64px;
+  border-radius: 4px;
+  background: var(--hover-strong);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: 0.15s;
+  user-select: none;
+}
+.edge-handle:hover .handle-grip {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------- 滚动条美化 ---------- */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box; /* 悬浮胶囊效果，两侧留白 */
+  min-height: 32px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  filter: brightness(0.88);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
