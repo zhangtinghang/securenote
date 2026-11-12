@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, inject } from "vue";
-import { vault, auth, setContentProtection } from "../api";
+import { ref, inject, onMounted } from "vue";
+import { vault, auth, setContentProtection, getBackupDir, chooseBackupDir, resetBackupDir, getAppVersion, forceBackup, openUrl } from "../api";
 import { applyTheme, themeOptions, type ThemeName } from "../theme";
+import { checkForUpdate, type UpdateInfo } from "../updater";
 
 const appConfirm = inject<(m: string, okText?: string) => Promise<boolean>>("appConfirm")!;
 
@@ -9,6 +10,88 @@ const toast = ref("");
 const oldPwd = ref("");
 const newPwd = ref("");
 const confirmPwd = ref("");
+
+/** 当前应用版本号（动态读取） */
+const appVersion = ref("1.0.0");
+
+/** 当前备份目录 */
+const backupDir = ref("");
+/** 是否正在检查更新 */
+const checkingUpdate = ref(false);
+
+onMounted(async () => {
+  // 读取当前版本号与备份目录
+  try {
+    appVersion.value = await getAppVersion();
+  } catch (e) {
+    /* 忽略 */
+  }
+  await refreshBackupDir();
+});
+
+async function refreshBackupDir() {
+  try {
+    backupDir.value = await getBackupDir();
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+/** 选择备份目录 */
+async function pickBackupDir() {
+  try {
+    const dir = await chooseBackupDir();
+    backupDir.value = dir;
+    showToast(`✓ 备份目录已更改为：${dir}`);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("取消")) return;
+    showToast("设置失败: " + msg);
+  }
+}
+
+/** 恢复默认备份目录 */
+async function resetBackupDirToDefault() {
+  try {
+    const dir = await resetBackupDir();
+    backupDir.value = dir;
+    showToast(`✓ 已恢复默认备份目录：${dir}`);
+  } catch (e: any) {
+    showToast("恢复失败: " + String(e?.message || e));
+  }
+}
+
+/** 手动检查更新 */
+async function manualCheckUpdate() {
+  if (checkingUpdate.value) return;
+  checkingUpdate.value = true;
+  try {
+    const current = await getAppVersion();
+    const info: UpdateInfo | null = await checkForUpdate(current);
+    if (!info) {
+      showToast(`✓ 已是最新版本（v${current}）`);
+      return;
+    }
+    const ok = await appConfirm(
+      `发现新版本 v${info.version}（当前 v${current}）。\n\n` +
+        `更新内容：\n${info.notes || "（无说明）"}\n\n` +
+        `⚠️ 升级前会先自动备份本地数据（滚动保留最近 3 份），\n` +
+        `本应用为离线本地应用，升级不会主动删除数据。是否前往下载？`,
+      "前往下载"
+    );
+    if (!ok) return;
+    try {
+      await forceBackup();
+    } catch (e) {
+      /* 备份失败不阻塞跳转 */
+    }
+    await openUrl(info.url);
+  } catch (e: any) {
+    showToast("检查更新失败: " + String(e?.message || e));
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
 
 /** 投屏/录屏内容保护（默认开启） */
 const contentProtection = ref((localStorage.getItem("sn_content_protection") ?? "1") === "1");
@@ -118,6 +201,17 @@ async function changePwd() {
         <h3>备份与还原</h3>
         <div class="row-card">
           <div class="desc">
+            <div class="t">自动备份位置</div>
+            <div class="s">关闭/升级时自动备份到此目录，滚动保留最近 3 份</div>
+            <div class="s path" :title="backupDir">{{ backupDir || "加载中…" }}</div>
+          </div>
+          <div class="btn-group">
+            <button class="btn" @click="pickBackupDir">📁 更改目录</button>
+            <button class="btn" @click="resetBackupDirToDefault">恢复默认</button>
+          </div>
+        </div>
+        <div class="row-card">
+          <div class="desc">
             <div class="t">一键导出全部数据</div>
             <div class="s">格式：加密 JSON（AES-256-GCM）· 含笔记 / 待办 / 密码库</div>
             <div class="s">导出文件不可直接读取，可上传云盘完成备份</div>
@@ -169,8 +263,13 @@ async function changePwd() {
       <section class="block about">
         <h3>关于</h3>
         <div class="about-line">
-          <span class="app-name">个人笔记本 <small>v1.0.0</small></span>
+          <span class="app-name">个人笔记本 <small>v{{ appVersion }}</small></span>
           <span class="copy">Copyright © 2026 zth · 开源协议 MIT</span>
+        </div>
+        <div class="about-actions">
+          <button class="btn" :disabled="checkingUpdate" @click="manualCheckUpdate">
+            {{ checkingUpdate ? "检查中…" : "🔄 检查更新" }}
+          </button>
         </div>
         <div class="info">
           <p>✓ 当前版本支持离线加密存储与客户端间互导</p>
@@ -302,6 +401,20 @@ h2 {
 .desc .s {
   font-size: 12px;
   color: var(--muted);
+}
+.desc .s.path {
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  word-break: break-all;
+  margin-top: 4px;
+}
+.btn-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.about-actions {
+  margin-bottom: 12px;
 }
 /* 拨动开关 */
 .switch {

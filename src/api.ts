@@ -86,6 +86,15 @@ export const forceBackup = () => invoke<string>("force_backup");
 /** 获取当前应用版本号 */
 export const getAppVersion = () => invoke<string>("get_app_version");
 
+/** 获取当前备份目录路径 */
+export const getBackupDir = () => invoke<string>("get_backup_dir");
+
+/** 弹出目录选择框，设置备份目录，返回新目录路径 */
+export const chooseBackupDir = () => invoke<string>("choose_backup_dir");
+
+/** 恢复默认备份目录 */
+export const resetBackupDir = () => invoke<string>("reset_backup_dir");
+
 /** 选择要导入的文档（docx/txt/log/md/csv/html），返回 [文件名, 扩展名, base64 内容] */
 export const pickDocFile = () =>
   invoke<[string, string, string]>("import_doc_file");

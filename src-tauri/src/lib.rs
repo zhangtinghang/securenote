@@ -714,7 +714,66 @@ fn set_content_protection(_window: tauri::WebviewWindow, _enable: bool) -> Resul
     Ok(())
 }
 
-/// 静默备份：导出加密库到 数据目录/backup/，滚动保留最近 3 份（不弹窗、不询问）
+/// 备份目录配置文件名（存于应用数据目录，与加密库分离，无需解锁即可读写）
+const BACKUP_SETTINGS_FILE: &str = "backup_settings.json";
+
+/// 读取用户配置的备份目录；未配置时回退到默认 数据目录/backup
+fn backup_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let data_dir = app.path().app_data_dir().ok()?;
+    let cfg_path = data_dir.join(BACKUP_SETTINGS_FILE);
+    // 尝试读取配置的自定义目录
+    if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(dir) = v.get("backup_dir").and_then(|d| d.as_str()) {
+                if !dir.trim().is_empty() {
+                    return Some(std::path::PathBuf::from(dir));
+                }
+            }
+        }
+    }
+    Some(data_dir.join("backup"))
+}
+
+/// 写入自定义备份目录
+fn set_backup_dir_inner(app: &tauri::AppHandle, dir: &str) -> Result<(), String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let cfg_path = data_dir.join(BACKUP_SETTINGS_FILE);
+    let json = serde_json::json!({ "backup_dir": dir }).to_string();
+    std::fs::write(&cfg_path, json).map_err(|e| format!("写入配置失败: {e}"))
+}
+
+/// 获取当前备份目录（供设置页展示）
+#[tauri::command]
+fn get_backup_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = backup_dir(&app).ok_or("无法获取应用数据目录")?;
+    Ok(dir.display().to_string())
+}
+
+/// 弹出目录选择框，让用户选择备份目录，返回新目录路径
+#[tauri::command]
+fn choose_backup_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let default = backup_dir(&app).unwrap_or_default();
+    let dir = rfd::FileDialog::new()
+        .set_title("选择备份存放目录")
+        .set_directory(&default)
+        .pick_folder();
+    let dir = dir.ok_or("已取消选择")?;
+    let path = dir.display().to_string();
+    set_backup_dir_inner(&app, &path)?;
+    Ok(path)
+}
+
+/// 恢复默认备份目录（数据目录/backup）
+#[tauri::command]
+fn reset_backup_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let default = data_dir.join("backup");
+    set_backup_dir_inner(&app, default.display().to_string().as_str())?;
+    Ok(default.display().to_string())
+}
+
+/// 静默备份：导出加密库到配置的备份目录，滚动保留最近 3 份（不弹窗、不询问）
 /// 返回 Some(备份路径) 表示本次完成备份；未解锁/无数据时返回 None
 fn backup_vault_silent(app: &tauri::AppHandle) -> Option<String> {
     let state: tauri::State<AppState> = app.state();
@@ -723,7 +782,7 @@ fn backup_vault_silent(app: &tauri::AppHandle) -> Option<String> {
         Ok(e) => e,
         Err(_) => return None,
     };
-    let dir = app.path().app_data_dir().ok()?.join("backup");
+    let dir = backup_dir(app)?;
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
@@ -769,8 +828,6 @@ fn force_backup(app: tauri::AppHandle) -> Result<String, String> {
 fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
-
-/// 升级/手动触发强制备份（静默，供更新流程与设置页调用）
 
 /// 用系统默认浏览器打开网址
 #[tauri::command]
@@ -1261,6 +1318,9 @@ pub fn run() {
             export_vault_to_file,
             force_backup,
             get_app_version,
+            get_backup_dir,
+            choose_backup_dir,
+            reset_backup_dir,
             set_content_protection,
             import_vault_from_file,
             import_vault,
