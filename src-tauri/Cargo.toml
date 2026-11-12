@@ -1,6 +1,6 @@
 [package]
 name = "securenote"
-version = "1.1.1"
+version = "1.2.0"
 description = "安全笔记 - 离线加密的跨平台个人效率应用"
 authors = ["SecureNote"]
 edition = "2021"

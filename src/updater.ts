@@ -8,7 +8,7 @@
 export const GITHUB_REPO = "zhangtinghang/securenote";
 
 /** 当前应用版本号（与 Cargo.toml 保持一致，构建后由 Rust 端提供真实值） */
-export const CURRENT_VERSION = "1.1.1";
+export const CURRENT_VERSION = "1.2.0";
 
 /** GitHub Releases API 地址（latest release） */
 export function latestReleaseUrl(): string {

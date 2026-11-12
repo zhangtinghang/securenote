@@ -231,14 +231,31 @@ impl Vault {
         Ok(())
     }
 
-    /// 全量导出：返回加密后的 base64 字符串
+    /// 全量导出：返回自包含的加密备份字符串。
+    /// 格式 = 明文密钥头(JSON) + "\n" + DEK 加密的 payload(base64)
+    /// 明文头仅含 salt/enc_dek/key_check（都是加密后的密钥材料，不含明文数据），
+    /// 安全性仍由主密码保证；这样备份文件可跨设备「从备份初始化」还原。
     pub fn export(&self) -> Result<String, VaultError> {
         let dek = self.dek()?;
+        let store = self.store();
+        let salt = store.get_meta("salt")?.ok_or(VaultError::NotInitialized)?;
+        let enc_dek = store.get_meta("enc_dek")?.ok_or(VaultError::NotInitialized)?;
+        let key_check = store.get_meta("key_check")?.ok_or(VaultError::NotInitialized)?;
+
         let payload = self.collect_payload()?;
         let json_str = serde_json::to_string(&payload)
             .map_err(|e| VaultError::Serialize(e.to_string()))?;
         let enc = encrypt(json_str.as_bytes(), dek.as_ref())?;
-        Ok(enc)
+
+        // 明文头：密钥材料（供跨设备还原）
+        let head = serde_json::json!({
+            "format": "securenote-vault",
+            "version": 2,
+            "salt": salt,
+            "enc_dek": enc_dek,
+            "key_check": key_check,
+        });
+        Ok(format!("{}\n{}", head.to_string(), enc))
     }
 
     /// 收集所有数据为 payload
@@ -251,15 +268,23 @@ impl Vault {
         let todos = Self::load_todos(&conn, dek.as_ref())?;
         let passwords = Self::load_passwords(&conn, dek.as_ref())?;
 
+        // 读取密钥材料，让备份文件自包含、可跨设备还原
+        let salt = store.get_meta("salt")?;
+        let enc_dek = store.get_meta("enc_dek")?;
+        let key_check = store.get_meta("key_check")?;
+
         Ok(SyncPayload {
             format: "securenote-vault".to_string(),
-            version: 1,
+            version: 2,
             exported_at: Utc::now().to_rfc3339(),
             payload: VaultData {
                 notes,
                 todos,
                 passwords,
                 meta: json!({}),
+                salt,
+                enc_dek,
+                key_check,
             },
         })
     }
@@ -268,7 +293,9 @@ impl Vault {
     /// mode: "merge" 合并（增量），"replace" 覆盖
     pub fn import(&self, encoded: &str, mode: &str) -> Result<usize, VaultError> {
         let dek = self.dek()?;
-        let plaintext = decrypt(encoded, dek.as_ref())?;
+        // 兼容新版自包含格式（"明文头\n密文"）与旧版纯密文
+        let body = Self::strip_backup_header(encoded);
+        let plaintext = decrypt(body, dek.as_ref())?;
         let payload: SyncPayload = serde_json::from_slice(&plaintext)
             .map_err(|e| VaultError::Serialize(e.to_string()))?;
 
@@ -292,6 +319,115 @@ impl Vault {
             count += Self::upsert_password(&conn, dek.as_ref(), pwd, mode)?;
         }
         Ok(count)
+    }
+
+    /// 剥离备份文件的明文头（若有），返回纯密文部分
+    fn strip_backup_header(encoded: &str) -> &str {
+        // 新版格式："{...}\n<base64密文>"，密文是 base64 不换行
+        if let Some((head, body)) = encoded.split_once('\n') {
+            if head.trim_start().starts_with('{') {
+                return body;
+            }
+        }
+        encoded
+    }
+
+    /// 从备份文件重建整个库（用于换电脑/重装后「从备份初始化」）：
+    /// 用主密码 + 备份内的 salt 派生 KEK，解开 enc_dek 得到 DEK，
+    /// 再用 DEK 解出数据写入当前（空）库，并设置 initialized 与密钥 meta。
+    /// 返回还原的条目总数。
+    pub fn restore_from_backup(
+        &self,
+        encoded: &str,
+        master_password: &str,
+    ) -> Result<usize, VaultError> {
+        // 解析自包含备份头（salt/enc_dek/key_check）
+        let (salt_b64, enc_dek_b64, key_check_b64) = Self::parse_backup_header(encoded)?;
+        let salt = base64_decode(&salt_b64).map_err(|e| VaultError::Serialize(e.to_string()))?;
+
+        // 主密码 → KEK
+        let kek = derive_key(master_password, &salt)?;
+
+        // 验证主密码（解 key_check）
+        let check = decrypt_str(&key_check_b64, &kek)?;
+        if check.as_str() != "securenote-key-check" {
+            return Err(VaultError::WrongPassword);
+        }
+
+        // 解 DEK
+        let dek_bytes = decrypt(&enc_dek_b64, &kek)?;
+        let mut dek = [0u8; 32];
+        dek.copy_from_slice(&dek_bytes);
+
+        // 解出数据 payload
+        let body = Self::strip_backup_header(encoded);
+        let plaintext = decrypt(body, &dek)?;
+        let payload: SyncPayload = serde_json::from_slice(&plaintext)
+            .map_err(|e| VaultError::Serialize(e.to_string()))?;
+
+        let store = self.store();
+        // 清空现有数据（全新重建）
+        {
+            let conn = store.conn_mut();
+            conn.execute("DELETE FROM notes", [])?;
+            conn.execute("DELETE FROM todos", [])?;
+            conn.execute("DELETE FROM passwords", [])?;
+        }
+
+        // 写入数据（用 DEK 加密存库）
+        let mut count = 0;
+        {
+            let conn = store.conn_mut();
+            for note in &payload.payload.notes {
+                count += Self::upsert_note(&conn, &dek, note, "replace")?;
+            }
+            for todo in &payload.payload.todos {
+                count += Self::upsert_todo(&conn, &dek, todo, "replace")?;
+            }
+            for pwd in &payload.payload.passwords {
+                count += Self::upsert_password(&conn, &dek, pwd, "replace")?;
+            }
+        }
+
+        // 写入密钥 meta，使新库可用相同主密码解锁
+        store.set_meta("initialized", "true")?;
+        store.set_meta("salt", &salt_b64)?;
+        store.set_meta("enc_dek", &enc_dek_b64)?;
+        store.set_meta("key_check", &key_check_b64)?;
+        store.set_meta("created_at", &Utc::now().to_rfc3339())?;
+
+        // 设置内存密钥（还原后即处于解锁状态）
+        let mut kek_arr = [0u8; 32];
+        kek_arr.copy_from_slice(&kek);
+        *self.master_key.write() = Some(MasterKey(Zeroizing::new(kek_arr)));
+        let mut dek_arr = [0u8; 32];
+        dek_arr.copy_from_slice(&dek);
+        *self.dek.write() = Some(Zeroizing::new(dek_arr));
+
+        Ok(count)
+    }
+
+    /// 解析自包含备份的明文头，返回 (salt, enc_dek, key_check)
+    fn parse_backup_header(encoded: &str) -> Result<(String, String, String), VaultError> {
+        let head = encoded.split_once('\n').map(|(h, _)| h).unwrap_or(encoded);
+        let meta: serde_json::Value = serde_json::from_str(head.trim())
+            .map_err(|e| VaultError::Serialize(format!("备份格式无法识别: {e}")))?;
+        let salt = meta
+            .get("salt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VaultError::Serialize("备份缺少 salt（可能是旧版格式）".to_string()))?
+            .to_string();
+        let enc_dek = meta
+            .get("enc_dek")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VaultError::Serialize("备份缺少 enc_dek".to_string()))?
+            .to_string();
+        let key_check = meta
+            .get("key_check")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VaultError::Serialize("备份缺少 key_check".to_string()))?
+            .to_string();
+        Ok((salt, enc_dek, key_check))
     }
 
     // ---- 辅助加载与 upsert ----
@@ -624,4 +760,114 @@ fn base64_encode(data: &[u8]) -> String {
 fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 创建临时目录下的独立 Vault 实例（隔离测试数据）
+    fn temp_vault() -> Vault {
+        let dir = std::env::temp_dir().join(format!("securenote-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Vault::new(dir).unwrap()
+    }
+
+    #[test]
+    fn test_export_restore_roundtrip_cross_device() {
+        // 源库：设置主密码，写入一条笔记
+        let src = temp_vault();
+        src.setup("my-master-password-123").unwrap();
+
+        // 写入一条笔记
+        {
+            let store = src.store();
+            let dek = src.dek().unwrap();
+            let conn = store.conn_mut();
+            let note = Note {
+                id: "note-1".to_string(),
+                title: "测试笔记".to_string(),
+                content: "这是正文内容".to_string(),
+                notebook: "默认".to_string(),
+                favorite: false,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                deleted_at: None,
+            };
+            conn.execute(
+                "INSERT INTO notes(id,title,content,notebook,favorite,created_at,updated_at,deleted_at) VALUES(?1,?2,?3,?4,?5,?6,?7,NULL)",
+                params![
+                    note.id,
+                    encrypt_str(&note.title, dek.as_ref()).unwrap(),
+                    encrypt_str(&note.content, dek.as_ref()).unwrap(),
+                    encrypt_str(&note.notebook, dek.as_ref()).unwrap(),
+                    0i64,
+                    note.created_at,
+                    note.updated_at,
+                ],
+            ).unwrap();
+        }
+
+        // 导出备份（自包含格式）
+        let backup = src.export().unwrap();
+        assert!(backup.contains('\n'), "备份应为「明文头\\n密文」格式");
+        assert!(backup.starts_with('{'), "备份应以明文 JSON 头开头");
+
+        // 模拟换电脑：新建一个空库（不同 salt），用「从备份初始化」还原
+        let dst = temp_vault();
+        // 目标库此时未初始化
+        assert!(!dst.is_initialized());
+
+        let count = dst
+            .restore_from_backup(&backup, "my-master-password-123")
+            .unwrap();
+        assert_eq!(count, 1, "应还原 1 条笔记");
+        assert!(dst.is_initialized(), "还原后应已初始化");
+        assert!(dst.is_unlocked(), "还原后应处于解锁状态");
+
+        // 验证数据还原正确
+        let store = dst.store();
+        let dek = dst.dek().unwrap();
+        let notes = Vault::load_notes(&store.conn(), dek.as_ref()).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "测试笔记");
+        assert_eq!(notes[0].content, "这是正文内容");
+    }
+
+    #[test]
+    fn test_restore_wrong_password_fails() {
+        let src = temp_vault();
+        src.setup("correct-password-123").unwrap();
+        let backup = src.export().unwrap();
+
+        let dst = temp_vault();
+        let result = dst.restore_from_backup(&backup, "wrong-password-456");
+        assert!(result.is_err(), "错误主密码应还原失败");
+        assert!(!dst.is_initialized(), "失败后不应初始化");
+    }
+
+    #[test]
+    fn test_export_import_same_vault_merge() {
+        let v = temp_vault();
+        v.setup("pwd-12345678").unwrap();
+        // 写入一条
+        {
+            let store = v.store();
+            let dek = v.dek().unwrap();
+            let conn = store.conn_mut();
+            conn.execute(
+                "INSERT INTO notes(id,title,content,notebook,favorite,created_at,updated_at,deleted_at) VALUES('n1','标题','内容','默认',0,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',NULL)",
+                params![
+                    encrypt_str("标题", dek.as_ref()).unwrap(),
+                    encrypt_str("内容", dek.as_ref()).unwrap(),
+                    encrypt_str("默认", dek.as_ref()).unwrap(),
+                ],
+            ).unwrap();
+        }
+        let backup = v.export().unwrap();
+        // 同库导入（merge）应成功且不重复
+        let count = v.import(&backup, "merge").unwrap();
+        assert_eq!(count, 1);
+    }
 }

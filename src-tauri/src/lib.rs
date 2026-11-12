@@ -870,6 +870,36 @@ fn import_vault(
         .map_err(|e| e.to_string())
 }
 
+/// 从备份文件重建整个库（用于首次启动「从备份初始化」）：
+/// 接受备份内容 + 主密码，验证并还原全部数据。返回还原条目数。
+#[tauri::command]
+fn restore_from_backup(
+    encoded: String,
+    master_password: String,
+    state: tauri::State<AppState>,
+) -> Result<usize, String> {
+    state
+        .vault
+        .restore_from_backup(&encoded, &master_password)
+        .map_err(|e| e.to_string())
+}
+
+/// 选择备份文件并读取其内容（供「从备份初始化」使用）
+#[tauri::command]
+fn pick_backup_file() -> Result<(String, String), String> {
+    let path = rfd::FileDialog::new()
+        .set_title("选择备份文件")
+        .add_filter("SecureNote 加密备份", &["snvault", "json", "txt"])
+        .pick_file();
+    let path = path.ok_or("已取消选择")?;
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok((name, content))
+}
+
 // ============ 提醒 ============
 
 #[tauri::command]
@@ -1324,6 +1354,8 @@ pub fn run() {
             set_content_protection,
             import_vault_from_file,
             import_vault,
+            restore_from_backup,
+            pick_backup_file,
             open_external_url,
             quit_app,
             schedule_reminder,

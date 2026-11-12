@@ -67,7 +67,14 @@ export const vault = {
   export: () => invoke<string>("export_vault"),
   import: (encoded: string, mode: string) =>
     invoke<number>("import_vault", { encoded, mode }),
+  /** 从备份文件重建整个库（换电脑/重装「从备份初始化」），返回还原条目数 */
+  restoreFromBackup: (encoded: string, masterPassword: string) =>
+    invoke<number>("restore_from_backup", { encoded, masterPassword }),
 };
+
+/** 选择备份文件并读取内容（供「从备份初始化」），返回 [文件名, 内容] */
+export const pickBackupFile = () =>
+  invoke<[string, string]>("pick_backup_file");
 
 /** 用系统默认浏览器打开链接 */
 export const openUrl = (url: string) =>

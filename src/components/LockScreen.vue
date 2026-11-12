@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, inject } from "vue";
-import { auth } from "../api";
+import { auth, vault, pickBackupFile } from "../api";
 
 const appConfirm = inject<(m: string, okText?: string) => Promise<boolean>>("appConfirm")!;
 
@@ -11,8 +11,60 @@ const password = ref("");
 const confirm = ref("");
 const error = ref("");
 const busy = ref(false);
+const restoring = ref(false);
+/** 已选择的备份文件内容（进入恢复流程后缓存） */
+const backupContent = ref("");
 
 const isSetup = computed(() => !props.initialized);
+
+/** 从备份初始化：先选文件，再让用户输入原主密码 */
+async function pickAndRestore() {
+  if (busy.value || restoring.value) return;
+  error.value = "";
+  try {
+    const [, data] = await pickBackupFile();
+    backupContent.value = data;
+    password.value = "";
+    confirm.value = "";
+    restoring.value = true; // 进入恢复输入状态
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("取消")) return;
+    error.value = "读取备份失败: " + msg;
+  }
+}
+
+/** 执行恢复（输入原主密码后调用） */
+async function doRestore() {
+  if (!backupContent.value) {
+    error.value = "请先选择备份文件";
+    return;
+  }
+  if (!password.value) {
+    error.value = "请输入该备份对应的主密码";
+    return;
+  }
+  if (busy.value) return;
+  busy.value = true;
+  error.value = "";
+  try {
+    await vault.restoreFromBackup(backupContent.value, password.value);
+    emit("unlocked");
+  } catch (e: any) {
+    error.value = "恢复失败: " + String(e?.message || e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/** 取消恢复，回到创建主密码流程 */
+function cancelRestore() {
+  restoring.value = false;
+  backupContent.value = "";
+  password.value = "";
+  confirm.value = "";
+  error.value = "";
+}
 
 const strength = computed(() => {
   const p = password.value;
@@ -84,47 +136,73 @@ async function resetAll() {
 <template>
   <div class="lock-wrap">
     <div class="lock-box">
-      <div class="lock-icon">{{ isSetup ? "🔐" : "🔓" }}</div>
-      <h1>{{ isSetup ? "创建主密码" : "欢迎回来" }}</h1>
+      <div class="lock-icon">{{ restoring ? "♻️" : isSetup ? "🔐" : "🔓" }}</div>
+      <h1>{{ restoring ? "从备份恢复" : isSetup ? "创建主密码" : "欢迎回来" }}</h1>
       <p class="sub">
         {{
-          isSetup
-            ? "主密码用于加密您的所有数据，请妥善保管，遗忘后无法找回"
-            : "输入主密码解锁您的加密存储库"
+          restoring
+            ? "输入备份对应的主密码，即可从备份文件重建全部数据"
+            : isSetup
+              ? "主密码用于加密您的所有数据，请妥善保管，遗忘后无法找回"
+              : "输入主密码解锁您的加密存储库"
         }}
       </p>
 
-      <input
-        v-model="password"
-        type="password"
-        :placeholder="isSetup ? '输入主密码（至少 8 位）' : '主密码'"
-        @keyup.enter="submit"
-      />
-      <input
-        v-if="isSetup"
-        v-model="confirm"
-        type="password"
-        placeholder="再次确认主密码"
-        @keyup.enter="submit"
-      />
+      <!-- 恢复模式：输入原主密码 -->
+      <template v-if="restoring">
+        <input
+          v-model="password"
+          type="password"
+          placeholder="输入备份对应的主密码"
+          @keyup.enter="doRestore"
+        />
+        <div v-if="error" class="error">{{ error }}</div>
+        <button class="btn primary submit" :disabled="busy" @click="doRestore">
+          {{ busy ? "恢复中..." : "♻️ 恢复并进入" }}
+        </button>
+        <div class="hint">
+          <a class="link" @click.prevent="cancelRestore">← 返回创建主密码</a>
+        </div>
+      </template>
 
-      <div v-if="isSetup && password" class="strength">
-        <div class="strength-bar" :style="{ width: strength.pct + '%', background: strength.color }"></div>
-      </div>
-      <div v-if="isSetup && password" class="strength-label" :style="{ color: strength.color }">
-        密码强度：{{ strength.label }}
-      </div>
+      <!-- 创建/解锁模式 -->
+      <template v-else>
+        <input
+          v-model="password"
+          type="password"
+          :placeholder="isSetup ? '输入主密码（至少 8 位）' : '主密码'"
+          @keyup.enter="submit"
+        />
+        <input
+          v-if="isSetup"
+          v-model="confirm"
+          type="password"
+          placeholder="再次确认主密码"
+          @keyup.enter="submit"
+        />
 
-      <div v-if="error" class="error">{{ error }}</div>
+        <div v-if="isSetup && password" class="strength">
+          <div class="strength-bar" :style="{ width: strength.pct + '%', background: strength.color }"></div>
+        </div>
+        <div v-if="isSetup && password" class="strength-label" :style="{ color: strength.color }">
+          密码强度：{{ strength.label }}
+        </div>
 
-      <button class="btn primary submit" :disabled="busy" @click="submit">
-        {{ busy ? "处理中..." : isSetup ? "创建并进入" : "解锁" }}
-      </button>
+        <div v-if="error" class="error">{{ error }}</div>
 
-      <div v-if="!isSetup" class="hint">
-        忘记主密码？
-        <a class="link" @click.prevent="resetAll">重置（将清空全部数据）</a>
-      </div>
+        <button class="btn primary submit" :disabled="busy" @click="submit">
+          {{ busy ? "处理中..." : isSetup ? "创建并进入" : "解锁" }}
+        </button>
+
+        <div v-if="isSetup" class="hint">
+          已有备份文件？
+          <a class="link" @click.prevent="pickAndRestore">从备份恢复</a>
+        </div>
+        <div v-if="!isSetup" class="hint">
+          忘记主密码？
+          <a class="link" @click.prevent="resetAll">重置（将清空全部数据）</a>
+        </div>
+      </template>
     </div>
   </div>
 </template>

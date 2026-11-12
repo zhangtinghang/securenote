@@ -117,4 +117,15 @@ pub struct VaultData {
     pub todos: Vec<Todo>,
     pub passwords: Vec<PasswordEntry>,
     pub meta: serde_json::Value,
+    /// 密钥材料（用于「从备份初始化」跨设备还原）：
+    /// - salt：主密码派生 KEK 用的盐（base64）
+    /// - enc_dek：用 KEK 加密后的数据加密密钥 DEK（base64）
+    /// - key_check：用 KEK 加密的校验串，用于验证主密码正确性（base64）
+    /// 这三个字段为新版导出才包含；旧版备份缺省，无法跨设备还原（仅能同库还原）
+    #[serde(default)]
+    pub salt: Option<String>,
+    #[serde(default)]
+    pub enc_dek: Option<String>,
+    #[serde(default)]
+    pub key_check: Option<String>,
 }
