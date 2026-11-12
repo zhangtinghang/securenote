@@ -60,7 +60,8 @@ git push -u origin main
 ```bash
 # 1. 改完代码后，同步三处版本号（见上文）
 
-# 2. 构建安装包
+# 2. 构建安装包（注意：需确保 MinGW 的 windres 在 PATH 中，见下方「构建环境」）
+export PATH="/c/mingw64/bin:$PATH"   # Windows 下 MinGW 工具链（windres/gcc）
 npx tauri build
 # 产物在 src-tauri/target/release/bundle/nsis/个人笔记本_x.y.z_x64-setup.exe
 
@@ -78,6 +79,18 @@ git push origin --tags
 # 6. 到 GitHub 仓库 Release 页面，基于 v1.1.0 tag 创建 Release，
 #    上传安装包，填写更新日志（更新日志会被应用拉取展示）
 ```
+
+### 构建环境注意事项（Windows）
+
+本项目 Rust 工具链为 `x86_64-pc-windows-gnu`，构建时需要 **MinGW 的 `windres`（和 `gcc`）** 来编译资源文件（图标 + 版本号）。
+
+- `windres` 位于 `C:\mingw64\bin\windres.exe`（若你的安装路径不同请对应调整）。
+- 若构建报错 `NotAttempted("windres")`，说明 PATH 里没有 MinGW，先执行：
+  ```bash
+  export PATH="/c/mingw64/bin:$PATH"
+  ```
+  再重新 `npx tauri build`。
+- 修改 `Cargo.toml` 的 `version` 会触发 build script 重新运行，务必确保此时 windres 可用。
 
 ### 提交信息规范
 
