@@ -258,13 +258,39 @@ impl Vault {
         &self,
         on_progress: &dyn Fn(u32, &str),
     ) -> Result<String, VaultError> {
+        let store = self.store();
+        let conn = store.conn();
+        self.export_with_conn(&conn, on_progress)
+    }
+
+    /// 用「独立只读连接」导出：不占用主连接锁，适合后台线程执行大数据量导出。
+    /// 独立连接打开同一个 vault 文件（WAL 模式支持多连接并发读），先 checkpoint 合并 WAL，
+    /// 使读到的是一致快照；全程不阻塞主线程的保存/刷新操作。
+    pub fn export_with_independent_conn(
+        &self,
+        on_progress: &dyn Fn(u32, &str),
+    ) -> Result<String, VaultError> {
+        let store = self.store();
+        let path = store.path().clone();
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        self.export_with_conn(&conn, on_progress)
+    }
+
+    /// 导出核心：用给定连接读取数据并生成加密备份串
+    fn export_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        on_progress: &dyn Fn(u32, &str),
+    ) -> Result<String, VaultError> {
         let dek = self.dek()?;
         let store = self.store();
         let salt = store.get_meta("salt")?.ok_or(VaultError::NotInitialized)?;
         let enc_dek = store.get_meta("enc_dek")?.ok_or(VaultError::NotInitialized)?;
         let key_check = store.get_meta("key_check")?.ok_or(VaultError::NotInitialized)?;
 
-        let payload = self.collect_payload(on_progress)?;
+        let payload = self.collect_payload(conn, on_progress)?;
         on_progress(62, "序列化数据中…");
         let json_str = serde_json::to_string(&payload)
             .map_err(|e| VaultError::Serialize(e.to_string()))?;
@@ -340,20 +366,24 @@ impl Vault {
         Ok((format!("{}\n{}", head.to_string(), enc), change_count))
     }
 
-    /// 收集所有数据为 payload（带进度回调：0-55 读取阶段）
-    fn collect_payload(&self, on_progress: &dyn Fn(u32, &str)) -> Result<SyncPayload, VaultError> {
+    /// 收集所有数据为 payload（带进度回调：0-55 读取阶段）。
+    /// conn 由调用方提供：既可以是主连接（普通导出），也可以是独立只读连接（后台导出，不占主连接锁）。
+    fn collect_payload(
+        &self,
+        conn: &rusqlite::Connection,
+        on_progress: &dyn Fn(u32, &str),
+    ) -> Result<SyncPayload, VaultError> {
         let dek = self.dek()?;
         let store = self.store();
-        let conn = store.conn();
 
         on_progress(4, "读取笔记中…");
-        let notes = Self::load_notes(&conn, dek.as_ref())?;
+        let notes = Self::load_notes(conn, dek.as_ref())?;
         on_progress(14, "读取待办中…");
-        let todos = Self::load_todos(&conn, dek.as_ref())?;
+        let todos = Self::load_todos(conn, dek.as_ref())?;
         on_progress(20, "读取密码库中…");
-        let passwords = Self::load_passwords(&conn, dek.as_ref())?;
+        let passwords = Self::load_passwords(conn, dek.as_ref())?;
         on_progress(26, "读取图片附件中…");
-        let attachments = Self::load_attachments(&conn, dek.as_ref())?;
+        let attachments = Self::load_attachments(conn, dek.as_ref())?;
         on_progress(55, "数据读取完成");
 
         // 读取密钥材料，让备份文件自包含、可跨设备还原

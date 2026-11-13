@@ -1392,6 +1392,90 @@ function onEditorDblclick(e: MouseEvent) {
   }
 }
 
+/* ---------- 预览层：滚轮缩放 + 拖动平移 + 双击切换 ---------- */
+const pvScale = ref(1); // 当前缩放倍数（1 = 适应窗口）
+const pvX = ref(0);
+const pvY = ref(0); // 平移偏移（px）
+const pvImgStyle = computed(() => ({
+  transform: `translate(${pvX.value}px, ${pvY.value}px) scale(${pvScale.value})`,
+  cursor: pvScale.value > 1.01 ? "grab" : "zoom-in",
+}));
+
+// 打开新预览时复位
+watch(previewSrc, (v) => {
+  if (v) {
+    pvScale.value = 1;
+    pvX.value = 0;
+    pvY.value = 0;
+  }
+});
+
+/** 以光标为锚点缩放：保持光标下的内容点不动 */
+function pvZoomAt(next: number, cx: number, cy: number) {
+  const old = pvScale.value;
+  if (next === old) return;
+  const dx = cx - window.innerWidth / 2;
+  const dy = cy - window.innerHeight / 2;
+  pvX.value = dx - (next / old) * (dx - pvX.value);
+  pvY.value = dy - (next / old) * (dy - pvY.value);
+  pvScale.value = next;
+}
+
+const PV_SCALE_MIN = 0.2;
+const PV_SCALE_MAX = 12;
+function onPreviewWheel(e: WheelEvent) {
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  pvZoomAt(
+    Math.min(PV_SCALE_MAX, Math.max(PV_SCALE_MIN, pvScale.value * factor)),
+    e.clientX,
+    e.clientY,
+  );
+}
+
+let pvDrag: { sx: number; sy: number; ox: number; oy: number; moved: boolean } | null = null;
+let pvSuppressClick = false; // 拖动结束后的 click 事件不要触发关闭
+
+function onPreviewMouseDown(e: MouseEvent) {
+  if (e.button !== 0) return;
+  pvDrag = { sx: e.clientX, sy: e.clientY, ox: pvX.value, oy: pvY.value, moved: false };
+}
+function onPreviewMouseMove(e: MouseEvent) {
+  if (!pvDrag) return;
+  const dx = e.clientX - pvDrag.sx;
+  const dy = e.clientY - pvDrag.sy;
+  if (Math.abs(dx) + Math.abs(dy) > 3) pvDrag.moved = true;
+  if (pvDrag.moved) {
+    pvX.value = pvDrag.ox + dx;
+    pvY.value = pvDrag.oy + dy;
+  }
+}
+function onPreviewMouseUp() {
+  const moved = pvDrag?.moved ?? false;
+  pvDrag = null;
+  if (moved) {
+    pvSuppressClick = true;
+    setTimeout(() => (pvSuppressClick = false), 350);
+  }
+}
+/** 点击空白处关闭（拖动结束的点击不关闭） */
+function onPreviewBgClick() {
+  if (pvSuppressClick) {
+    pvSuppressClick = false;
+    return;
+  }
+  previewSrc.value = "";
+}
+/** 双击：适应窗口 ↔ 2.5x（以光标为中心） */
+function onPreviewDblclick(e: MouseEvent) {
+  if (pvScale.value > 1.01) {
+    pvScale.value = 1;
+    pvX.value = 0;
+    pvY.value = 0;
+  } else {
+    pvZoomAt(2.5, e.clientX, e.clientY);
+  }
+}
+
 /** 编辑器内点击：识别点中的表格单元格 / 图片，顶部钉住对应子工具栏 */
 function onEditorClick(e: MouseEvent) {
   const t = e.target as HTMLElement;
@@ -1857,7 +1941,7 @@ onMounted(() => {
   load();
   document.addEventListener("click", closeCtx);
   document.addEventListener("click", closeNbCtx);
-  // 预览层 Esc 关闭
+  // 预览层 Esc 关闭 + 拖动跟踪（挂 window，快速拖动出遮罩范围也能跟上）
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       previewSrc.value = "";
@@ -1865,6 +1949,8 @@ onMounted(() => {
       if (nbDialog.value) nbDialog.value = null;
     }
   });
+  window.addEventListener("mousemove", onPreviewMouseMove);
+  window.addEventListener("mouseup", onPreviewMouseUp);
 });
 </script>
 
@@ -2066,9 +2152,18 @@ onMounted(() => {
       <div class="item danger" @click="removeNote(ctxMenu.note)">🗑️ 删除（进回收站）</div>
     </div>
 
-    <!-- 图片双击放大预览（点击任意处 / Esc 关闭） -->
-    <div v-if="previewSrc" class="img-preview" title="点击关闭（Esc 也可）" @click="previewSrc = ''">
-      <img :src="previewSrc" alt="预览" />
+    <!-- 图片双击放大预览：滚轮缩放 / 拖动平移 / 双击切换 / 点空白或 Esc 关闭 -->
+    <div
+      v-if="previewSrc"
+      class="img-preview"
+      :title="pvScale > 1.01 ? '拖动移动 · 滚轮缩放 · 双击复原 · 点空白或 Esc 关闭' : '滚轮缩放 · 双击放大 · 点空白或 Esc 关闭'"
+      @wheel.prevent="onPreviewWheel"
+      @mousedown="onPreviewMouseDown"
+      @click.self="onPreviewBgClick"
+      @dblclick="onPreviewDblclick"
+    >
+      <img :src="previewSrc" alt="预览" :style="pvImgStyle" draggable="false" />
+      <div v-if="pvScale > 1.01" class="pv-zoom-badge">{{ Math.round(pvScale * 100) }}%</div>
     </div>
 
     <!-- 笔记本密码对话框：解锁 / 设置 / 移除 -->
@@ -2725,6 +2820,31 @@ onMounted(() => {
   max-height: 92vh;
   border-radius: 8px;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+  will-change: transform;
+  user-select: none;
+  -webkit-user-drag: none;
+  /* 透明 PNG 底衬：棋盘格背景（与图片编辑器一致），透明区域不再透出黑色遮罩 */
+  background-color: #ffffff;
+  background-image:
+    linear-gradient(45deg, #e3e3e3 25%, transparent 25%, transparent 75%, #e3e3e3 75%),
+    linear-gradient(45deg, #e3e3e3 25%, transparent 25%, transparent 75%, #e3e3e3 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+}
+/* 预览层缩放比例角标 */
+.pv-zoom-badge {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 12px;
+  border-radius: 999px;
+  pointer-events: none;
+  z-index: 501;
 }
 /* 表格边框（Word 导入的表格 mammoth 不带样式，统一显示边框） */
 .rich-editor :deep(table),

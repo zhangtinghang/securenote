@@ -1180,31 +1180,58 @@ fn reset_backup_dir(
     Ok(default.display().to_string())
 }
 
-/// 手动触发全量备份（供升级流程与设置页"立即备份"调用），返回备份文件名
+/// 手动触发全量备份：后台线程 + 文件级快照（SQLite 在线备份直接复制加密 vault 文件）。
+/// 相比逻辑导出（解密全部附件→重加密→序列化），速度快 1-2 个数量级且不卡 UI。
+/// 进度走 export-progress 事件（kind=backup-full），完成后发 export-done。
 #[tauri::command]
-fn force_backup(app: tauri::AppHandle) -> Result<String, String> {
-    // 手动备份成功后同步数据指纹，避免闲时线程重复备份同一份内容
-    let fp = vault_fingerprint(&app);
-    let point = create_full_backup(&app).map_err(|e| format!("备份失败: {e}"))?;
-    *LAST_BACKUP_FINGERPRINT.lock() = fp;
-    Ok(point.filename)
+fn force_backup(app: tauri::AppHandle, job: tauri::State<BgTaskState>) -> Result<String, String> {
+    if !try_acquire_task(&job) {
+        return Err("已有后台任务进行中，请稍后再试".to_string());
+    }
+    let app2 = app.clone();
+    let job2 = job.inner().clone();
+    std::thread::spawn(move || {
+        let report = |p: u32, m: &str| {
+            set_task_progress(&job2, &app2, "backup-full", "run", p, m, "");
+        };
+        let result = create_full_backup(&app2, &report);
+        match result {
+            Ok(point) => {
+                // 同步数据指纹，避免闲时线程重复备份
+                let fp = vault_fingerprint(&app2);
+                *LAST_BACKUP_FINGERPRINT.lock() = fp;
+                emit_task_done(&job2, &app2, "backup-full", true, "全量备份完成", "", &point.filename);
+            }
+            Err(e) => emit_task_done(&job2, &app2, "backup-full", false, "备份失败", &e, ""),
+        }
+        release_task(&job2);
+    });
+    Ok("全量备份已开始".to_string())
 }
 
 // ==================== 备份版本管理（类 git：全量 + 增量 + 回滚） ====================
 
 const MANIFEST_FILE: &str = "manifest.json";
 
-/// 读取备份清单；不存在或损坏时返回默认（空）清单
+/// 读取备份清单；不存在或损坏时返回默认（空）清单。
+/// 兜底纠正历史坏数据：max_full/inc_threshold 为 0 时（旧版 derive(Default) 写入）恢复默认值。
 fn read_manifest(app: &tauri::AppHandle) -> BackupManifest {
     let dir = match backup_dir(app) {
         Some(d) => d,
         None => return BackupManifest::default(),
     };
     let path = dir.join(MANIFEST_FILE);
-    std::fs::read_to_string(&path)
+    let mut manifest = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str::<BackupManifest>(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if manifest.max_full == 0 {
+        manifest.max_full = 3;
+    }
+    if manifest.inc_threshold == 0 {
+        manifest.inc_threshold = 20;
+    }
+    manifest
 }
 
 /// 写备份清单（备份目录需已存在）
@@ -1222,6 +1249,8 @@ fn new_backup_id() -> String {
 
 /// 清理：全量备份保留上限（滚动删除最旧的全量，并级联删除基于它的增量）
 fn enforce_full_retention(app: &tauri::AppHandle, manifest: &mut BackupManifest) {
+    // 保险丝：至少保留 1 份全量（max_full=0 会导致刚备份就被删光）
+    let max_full = manifest.max_full.max(1);
     let fulls: Vec<usize> = manifest
         .points
         .iter()
@@ -1229,7 +1258,7 @@ fn enforce_full_retention(app: &tauri::AppHandle, manifest: &mut BackupManifest)
         .filter(|(_, p)| p.kind == BackupKind::Full)
         .map(|(i, _)| i)
         .collect();
-    if fulls.len() <= manifest.max_full {
+    if fulls.len() <= max_full {
         return;
     }
     // 最旧的一个全量及更早的所有点都要删（保持链完整）
@@ -1244,10 +1273,17 @@ fn enforce_full_retention(app: &tauri::AppHandle, manifest: &mut BackupManifest)
     }
 }
 
-/// 创建全量备份点（完整快照），返回新点；自动滚动保留最近 max_full 份
-fn create_full_backup(app: &tauri::AppHandle) -> Result<BackupPoint, String> {
+/// 创建全量备份点（逻辑导出：完整加密快照 .snvault），返回新点；自动滚动保留最近 max_full 份。
+/// 用独立只读连接导出，不占主连接锁；必须在后台线程调用（配合 report 进度回调）。
+fn create_full_backup(
+    app: &tauri::AppHandle,
+    report: &dyn Fn(u32, &str),
+) -> Result<BackupPoint, String> {
     let state: tauri::State<AppState> = app.state();
-    let encoded = state.vault.export().map_err(|e| e.to_string())?;
+    let encoded = state
+        .vault
+        .export_with_independent_conn(&|p, m| report(p, m))
+        .map_err(|e| e.to_string())?;
     let dir = backup_dir(app).ok_or("无法获取备份目录")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
@@ -1281,7 +1317,7 @@ fn create_incremental_backup(app: &tauri::AppHandle) -> Result<BackupPoint, Stri
     // 无任何备份点时退化为全量备份（增量必须有基准）
     let last = match manifest.points.last() {
         Some(p) => p.clone(),
-        None => return create_full_backup(app),
+        None => return create_full_backup(app, &|_, _| {}),
     };
     let since = last.created_at.clone();
     let (encoded, change_count) = state
@@ -1370,7 +1406,7 @@ fn rollback_to_backup(
         let result = (|| -> Result<(), String> {
             report(2, "回滚前备份当前状态…");
             // 先全量备份当前状态（安全兜底，可再滚回来）
-            let _ = create_full_backup(&app2);
+            let _ = create_full_backup(&app2, &report);
 
             let state: tauri::State<AppState> = app2.state();
             let manifest = read_manifest(&app2);

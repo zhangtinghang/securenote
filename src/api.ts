@@ -135,7 +135,7 @@ export const deleteBackupPoint = (id: string) =>
 
 /** 回滚到指定备份点（后台执行，进度走 export-progress 事件） */
 export const rollbackToBackup = (id: string) =>
-  invoke<string>("rollback_to_backup", { id });
+  invoke<string>("rollback_to_backup", { targetId: id });
 
 /** 获取当前应用版本号 */
 export const getAppVersion = () => invoke<string>("get_app_version");

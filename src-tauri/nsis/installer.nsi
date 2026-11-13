@@ -34,8 +34,8 @@ ${StrLoc}
 
 !define MANUFACTURER "securenote"
 !define PRODUCTNAME "个人笔记本"
-!define VERSION "1.3.0"
-!define VERSIONWITHBUILD "1.3.0.0"
+!define VERSION "1.3.1"
+!define VERSIONWITHBUILD "1.3.1.0"
 !define HOMEPAGE ""
 !define INSTALLMODE "currentUser"
 !define LICENSE ""

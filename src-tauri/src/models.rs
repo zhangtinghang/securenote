@@ -177,7 +177,7 @@ pub struct BackupPoint {
 }
 
 /// 备份清单（backup 目录下 manifest.json）
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     /// 按时间升序排列的备份点
     pub points: Vec<BackupPoint>,
@@ -187,6 +187,19 @@ pub struct BackupManifest {
     /// 增量备份数量达到此阈值后建议全量备份（默认 20）
     #[serde(default = "default_inc_threshold")]
     pub inc_threshold: usize,
+}
+
+// 注意：不能用 derive(Default)——usize 默认是 0，会导致首次备份时
+// enforce_full_retention 把刚创建的全量备份当作"超额"立刻删掉。
+// serde(default=...) 只影响反序列化缺字段的情况，不影响 Default::default()。
+impl Default for BackupManifest {
+    fn default() -> Self {
+        Self {
+            points: Vec::new(),
+            max_full: default_max_full(),
+            inc_threshold: default_inc_threshold(),
+        }
+    }
 }
 
 fn default_max_full() -> usize {
